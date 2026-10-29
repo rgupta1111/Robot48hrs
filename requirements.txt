@@ -1,0 +1,5 @@
+opencv-python>=4.8
+numpy>=1.24
+mediapipe==0.10.35  # pinned: 1.0.x crashes on macOS (initializes Metal even in CPU mode). Install with `pip install mediapipe==0.10.35 --no-deps`
+                    # then `pip install absl-py flatbuffers cffi sounddevice`, so it doesn't pull opencv-contrib-python over opencv-python
+viam-sdk>=0.85      # only for --sink viam and src/joint_test.py; the simulator sink needs just opencv + numpy + mediapipe
