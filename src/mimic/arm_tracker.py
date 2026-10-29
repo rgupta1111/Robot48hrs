@@ -7,7 +7,7 @@ from ._mp import landmarker, to_mp_image
 
 # MediaPipe pose landmark indices: (shoulder, elbow, wrist)
 ARMS = {"right": (12, 14, 16), "left": (11, 13, 15)}
-MIN_VISIBILITY = 0.5
+MIN_VISIBILITY = 0.3
 
 
 @dataclass
@@ -32,7 +32,7 @@ class ArmTracker:
         if not res.pose_landmarks:
             return None
         lm, world = res.pose_landmarks[0], res.pose_world_landmarks[0]
-        vis = min(min(lm[i].visibility, lm[i].presence) for i in self.ids)
+        vis = min(lm[i].visibility or 0.0 for i in self.ids)
         if vis < MIN_VISIBILITY:
             return None
         h, w = frame.shape[:2]

@@ -6,6 +6,7 @@ arm frame with TableToWorld. Credentials come from VIAM_API_KEY / VIAM_API_KEY_I
 import asyncio
 import math
 import os
+import sys
 import threading
 from dataclasses import dataclass
 
@@ -25,10 +26,14 @@ class TableToWorld:
 class ViamRobot:
     def __init__(self, address, arm_name="arm", gripper_name="gripper", camera_name=None, table_to_world=None,
                  workspace=None, max_z_mm=None, insecure=False, allow_collisions=None):
-        from viam.components.arm import Arm
-        from viam.components.gripper import Gripper
-        from viam.robot.client import RobotClient
-        from viam.rpc.dial import DialOptions
+        try:
+            from viam.components.arm import Arm
+            from viam.components.gripper import Gripper
+            from viam.robot.client import RobotClient
+            from viam.rpc.dial import DialOptions
+        except ModuleNotFoundError as e:
+            raise SystemExit(f"{e}\nThis Python ({sys.executable}) lacks the Viam SDK. Use the project venv: "
+                             "source scripts/setup_env.sh  (or: scripts/run.sh <script> ...)") from None
 
         self.table = table_to_world or TableToWorld()
         self.workspace, self.max_z_mm = workspace, max_z_mm

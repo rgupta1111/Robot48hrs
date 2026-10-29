@@ -96,13 +96,15 @@ def debug_lines(ctl, status, pose, hand, hands, sink, joint_on, cfg):
         hand_txt = f"hand: REJECTED ({info['dist_px']:.0f}px > {info['limit_px']:.0f}px from tracked wrist)"
     lines = [f"state: {status.state}" + ("" if cfg.pinch_only else f"   arm pose: {'ok' if pose is not None else 'NOT SEEN'}"),
              hand_txt]
+    stats = getattr(sink, "stats", {})
     if joint_on:
-        d, stats = ctl.debug, getattr(sink, "stats", {})
+        d = ctl.debug
         lines.append(f"pinch raw {d['ratio_raw']:.2f}  smooth {d['ratio_smooth']:.2f}  -> goal {d['goal']:.0f} deg"
                      if d else "pinch: (no value yet)")
         sent = stats.get("joint_sent")
         lines.append(f"joint {cfg.pinch_joint}: cmd {status.joint_deg if status.joint_deg is not None else float('nan'):.1f}"
                      f"  sent {'-' if sent is None else format(sent, '.1f')}   moves {stats.get('joint_moves', '-')}")
+    if joint_on or "joints" in stats or "poll_error" in stats:
         lines += joint_rows(stats, cfg.pinch_joint)
     return lines
 
@@ -282,7 +284,8 @@ def main():
     else:
         sink = SimSink(verbose=args.no_display)
 
-    debug = (args.debug or joint_on) and not args.no_debug
+    panel = not args.no_debug                      # on-screen diagnostics incl. every joint angle
+    debug = (args.debug or joint_on) and panel     # console printing
     if joint_on and not pinch_only:
         if yaw_conflict:
             print("note: wrist yaw is off because the pinch drives the last wrist joint (the tool twist)", flush=True)
@@ -321,9 +324,10 @@ def main():
             if want_engage:
                 if pose is not None or (joint_on and hand is not None):
                     if not ctl.engaged:
+                        print("moving arm to the start pose...", flush=True)
                         sink.prepare(cfg.start)  # may take a moment on a real arm: it moves to the start pose
                         prepared = True
-                        if ctl.engage(pose, t):
+                        if ctl.engage(pose, t, hand):
                             note = ("pinch -> joint %d" % args.pinch_joint if pinch_only
                                     else "following + pinch -> joint %d" % args.pinch_joint if joint_on else "following")
                             pinch.reset()
@@ -335,10 +339,12 @@ def main():
                             if debug:
                                 print(f"[dbg] ENGAGED at t={t:.1f}s ({note})", flush=True)
                     want_engage = False
-                elif debug and t - last_dbg > 1.5:
-                    last_dbg = t
-                    print("[dbg] waiting to engage: " + ("no hand seen yet" if joint_on else "arm pose not visible - "
-                          "keep your shoulder, elbow and wrist in view"), flush=True)
+                else:
+                    note = ("waiting to engage: no hand seen yet" if joint_on else
+                            "waiting to engage: arm pose not visible - keep shoulder, elbow, wrist in view")
+                    if t - last_dbg > 1.5:
+                        last_dbg = t
+                        print(note, flush=True)
             cmd, status = ctl.update(pose, t, hand)
             if sweep_pending:
                 if not prepared:
@@ -368,7 +374,7 @@ def main():
             if getattr(sink, "error", None):
                 print("ARM ERROR:", sink.error)
                 break
-            dlines = debug_lines(ctl, status, pose, hand, hands, sink, joint_on, cfg) if debug else None
+            dlines = debug_lines(ctl, status, pose, hand, hands, sink, joint_on, cfg) if panel else None
             if debug and (ctl.engaged or sweep_t0 is not None) and t - last_dbg > 0.5:
                 last_dbg = t
                 print(f"[dbg {t:6.1f}s] " + " | ".join(dlines), flush=True)
