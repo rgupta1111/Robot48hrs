@@ -59,7 +59,8 @@ async def connect(address):
 class Perceiver:
     """One call -> where the tracked object is right now (world frame), how big it is, and whether a person is close."""
 
-    def __init__(self, robot, camera_name, gripper_name, cam, intr, model, dargs, label, person_mm):
+    def __init__(self, robot, camera_name, gripper_name, cam, intr, model, dargs, label, person_mm, aim_frac=0.5):
+        self.aim_frac = aim_frac     # where along the object's height to aim: 0.5 = its middle, 0.85 = near the top (the neck of a bottle)
         self.robot, self.camera_name, self.gripper_name, self.cam, self.intr = robot, camera_name, gripper_name, cam, intr
         self.model, self.dargs, self.label, self.person_mm = model, dargs, label, person_mm
         self.lock, self.widths, self.heights = Lock(max_jump_frac=0.5, lost_after=10 ** 6), [], []
@@ -141,7 +142,12 @@ class Perceiver:
             u = box[0] + wpx / 2
         cam_pt = Pose(x=(u - cx) * zc / fx, y=(v - cy) * zc / fy, z=zc)
         wp = (await self.robot.transform_pose(PoseInFrame(reference_frame=self.camera_name, pose=cam_pt), "world")).pose
-        rel = (await self.robot.transform_pose(PoseInFrame(reference_frame=self.camera_name, pose=cam_pt), self.gripper_name)).pose
+        aim_up = (self.aim_frac - 0.5) * float(np.median(self.heights)) if (self.aim_frac != 0.5 and len(self.heights) >= 3) else 0.0
+        if aim_up:                                        # aim higher/lower on the object (world z is up), then express it in the gripper frame
+            wp.z += aim_up
+            rel = (await self.robot.transform_pose(PoseInFrame(reference_frame="world", pose=Pose(x=wp.x, y=wp.y, z=wp.z)), self.gripper_name)).pose
+        else:
+            rel = (await self.robot.transform_pose(PoseInFrame(reference_frame=self.camera_name, pose=cam_pt), self.gripper_name)).pose
         self.expected = np.array([wp.x, wp.y, wp.z])      # follow this object from now on
         return {"seen": True, "world": np.array([wp.x, wp.y, wp.z]), "rel_mm": np.array([rel.x, rel.y, rel.z]), "depth_mm": z, "width_mm": width, "height_mm": height,
                 "person_close": person_close}
@@ -160,7 +166,7 @@ async def main_async(args):
         ip = (await cam.get_properties()).intrinsic_parameters
         intr = {"fx": ip.focal_x_px, "fy": ip.focal_y_px, "cx": ip.center_x_px, "cy": ip.center_y_px, "w": ip.width_px, "h": ip.height_px}
         model, dargs = load_detector(args.object)
-        eye = Perceiver(robot, args.camera, args.gripper, cam, intr, model, dargs, args.object, args.person_mm)
+        eye = Perceiver(robot, args.camera, args.gripper, cam, intr, model, dargs, args.object, args.person_mm, args.aim_height_frac)
         if args.near_world:
             eye.expected = np.array([float(v) for v in args.near_world.split(",")])
 
@@ -417,6 +423,8 @@ def main():
     ap.add_argument("--min-z-mm", type=float, default=75.0, help="never plan below this world height: table top (-23, from the machine config) + 80 mm gripper half-height + margin")
     ap.add_argument("--max-reach-mm", type=float, default=800.0, help="refuse objects further than this from the base axis")
     ap.add_argument("--max-cycles", type=int, default=60)
+    ap.add_argument("--aim-height-frac", type=float, default=0.5, help="where on the object's height the gripper aims: 0.5 = middle, "
+                    "0.85 = near the top, e.g. the neck of a bottle (use with --grip-width-mm = the neck's width)")
     ap.add_argument("--grip-width-mm", type=float, help="override the measured width (the fingers close to this opening)")
     ap.add_argument("--wrist-joint", type=int, default=0, help="joint that flattens the gripper (Viam app numbering); 0 = try 4 and 5 and pick "
                     "the one that works from the current pose (never 6)")
