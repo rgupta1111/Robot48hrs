@@ -395,8 +395,8 @@ async def main_async(args):
             print(f"joint {jn} rotated {sign * total:+.0f} deg; gripper axis ({gp.o_x:+.2f}, {gp.o_y:+.2f}, {gp.o_z:+.2f})", flush=True)
 
         async def survey():
-            """No bottle in view at the start and no remembered position: look around. Sweep the base in 15-degree steps out to
-            +/-45 degrees, looking after each move; stop at the first bottle seen (nearest by depth in that view)."""
+            """Nothing in view at the start and no remembered position: look around. Sweep the base in --survey-step-deg steps out to
+            +/- --survey-deg, looking after each move; stop at the first object seen (nearest by depth in that view)."""
             print("no bottle in view: looking around ...", flush=True)
             if abs((await gripper_pose()).o_z) >= 0.08:        # exploring is easier with the gripper level: use the two flattening joints
                 try:
@@ -407,7 +407,8 @@ async def main_async(args):
             if t:
                 return t
             j_here = list((await arm.get_joint_positions()).values)
-            for d in (15.0, -15.0, 30.0, -30.0, 45.0, -45.0):
+            steps = [a * sg for a in np.arange(args.survey_step_deg, args.survey_deg + 1e-6, args.survey_step_deg) for sg in (1.0, -1.0)]
+            for d in steps:
                 j = list(j_here)
                 j[0] += d
                 await arm.move_to_joint_positions(JointPositions(values=j))
@@ -462,7 +463,7 @@ async def main_async(args):
         not_in_view = tgt is None
         known0 = (eye.expected if not_in_view else tgt["world"])      # None: nothing seen and nothing remembered
         if not_in_view and not real:
-            raise SystemExit(f"no {args.object} with a depth reading in view (a real run would look around: sweep the base +/-45 deg)")
+            raise SystemExit(f"no {args.object} with a depth reading in view (a real run would look around: sweep the base +/-{args.survey_deg:.0f} deg)")
         if known0 is not None:
             reach = float(np.hypot(*known0[:2]))
             print(f"the object is {reach:.0f} mm from the base axis (arm reach ~850 mm); width estimate {eye.width_estimate()} mm", flush=True)
@@ -476,7 +477,7 @@ async def main_async(args):
             return
         if not confirm("The arm WILL make planned moves toward the nearest object, re-planning every step"
                        + ((" (it cannot see it from here, so it will first search nearby: back off, sweep the base)" if known0 is not None else
-                           " (no bottle in view, so it will first LOOK AROUND: level the gripper with joints 4/5 if needed, scan with the wrist (joints 4 and 5), then sweep the base left and right, up to 45 degrees)")
+                           f" (no {args.object} in view, so it will first LOOK AROUND: level the gripper with joints 4/5 if needed, scan with the wrist (joints 4 and 5), then sweep the base left and right, up to {args.survey_deg:.0f} degrees)")
                           if not_in_view else "")
                        + ". E-stop in reach?"):
             return
@@ -613,6 +614,8 @@ def main():
     ap.add_argument("--memory-file", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "object_memory.json"),
                     help="where the object's remembered position and size are saved")
     ap.add_argument("--use-memory", action="store_true", help="start from the remembered object position/size in --memory-file (it may be stale)")
+    ap.add_argument("--survey-deg", type=float, default=20.0, help="initial look-around: sweep the base out to +/- this many degrees")
+    ap.add_argument("--survey-step-deg", type=float, default=10.0, help="initial look-around: base step between looks")
     ap.add_argument("--near-world", help="x,y,z (mm, world): start with the object nearest this point (to pick a particular one)")
     ap.add_argument("--looks", type=int, default=8, help="dry run: how many times to look (move the object to watch it follow)")
     ap.add_argument("--standoff-mm", type=float, default=250.0, help="pre-grasp distance short of the object (the wrist is flattened here, "
