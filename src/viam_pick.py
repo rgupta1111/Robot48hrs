@@ -493,13 +493,106 @@ async def main_async(args):
                 try:
                     await motion.move(args.gripper, goal, world_state=ws, constraints=allow)
                 except Exception as e:
+                    if allow is None:
+                        raise
+                    say(f"  with the claws/object exception the planner said: {str(e)[:220]}", flush=True)
+                    say("  final advance: retrying this step without the obstacle", flush=True)
+                    await motion.move(args.gripper, goal, world_state=None)
+            except Exception as e:
+                if "IK solution" in str(e) or "unreachable" in str(e) or "obstacle constraint" in str(e):
+                    return False
+                raise
+            await check_j6()
+            return True
+
+        async def rel_of(t, known_world):
+            """The object in the GRIPPER's own frame (z = along the gripper axis): straight from the latest reading, or, when it is
+            out of view, the last known world position converted by the frame system. Independent of world-frame drift."""
+            if t:
+                return t["rel_mm"]
+            p = (await robot.transform_pose(PoseInFrame(reference_frame="world", pose=Pose(x=float(known_world[0]), y=float(known_world[1]),
+                                                                                           z=float(known_world[2]))), args.gripper)).pose
+            return np.array([p.x, p.y, p.z])
+
+        vox = VoxelMap() if args.voxel else None
+
+        async def cam_to_world():
+            """The camera's pose in the world as (R, origin): the frame system maps the camera's origin and unit axes."""
+            async def pt(x, y, z):
+                p = (await robot.transform_pose(PoseInFrame(reference_frame=args.camera, pose=Pose(x=x, y=y, z=z)), "world")).pose
+                return np.array([p.x, p.y, p.z])
+            o = await pt(0, 0, 0)
+            return np.stack([await pt(1, 0, 0) - o, await pt(0, 1, 0) - o, await pt(0, 0, 1) - o], axis=1), o
+
+        async def vox_update():
+            """Fold the latest depth frame into the voxel map (rays carve free space, so an object a person moves is cleared and re-added)."""
+            if vox is None or eye.last_dmap is None:
+                return
+            h_, w_ = eye.last_dmap.shape[:2]
+            sx_, sy_ = w_ / intr["w"], h_ / intr["h"]
+            pts = depth_to_points(eye.last_dmap, intr["fx"] * sx_, intr["fy"] * sy_, intr["cx"] * sx_, intr["cy"] * sy_, stride=args.voxel_stride)
+            R_, o_ = await cam_to_world()
+            await asyncio.to_thread(vox.integrate, pts @ R_.T + o_, o_)
+
+        async def object_obstacle(rel):
+            """The object as a box obstacle for the planner, placed from the SAME gripper-frame measurement that drives the move (so the
+            two always agree; the remembered world position can differ from it by ~10 cm). None if there is no measurement."""
+            if rel is None:
+                return None
+            wp = (await robot.transform_pose(PoseInFrame(reference_frame=args.gripper, pose=Pose(x=float(rel[0]), y=float(rel[1]),
+                                                                                                 z=float(rel[2]))), "world")).pose
+            wd, ht = memory.width or 90.0, memory.height or 220.0      # defaults when its size is not known (its box was clipped)
+            centre, dims = np.array([wp.x, wp.y, wp.z]), np.array([wd + 10, wd + 10, ht + 10])
+            if vox is not None:                                       # the map's real extent of whatever stands there now, if it has seen it
+                box = vox.object_box(centre, radius_mm=250.0, min_z_mm=args.table_top_mm + 40.0)
+                if box is not None:
+                    centre, dims = box
+            g = Geometry(center=Pose(x=float(centre[0]), y=float(centre[1]), z=float(centre[2])),
+                         box=RectangularPrism(dims_mm=Vector3(x=float(dims[0]), y=float(dims[1]), z=float(dims[2]))), label=args.object)
+            return WorldState(obstacles=[GeometriesInFrame(reference_frame="world", geometries=[g])])
+
+        j6_ref = {"v": None}
+
+        async def check_j6():
+            """Joint 6 (the final roll) must not wander: the planner holds the gripper's world orientation, so a long base swing can
+            make it spin. Stop if it has turned more than --max-j6-deg from where the run began."""
+            j6 = (await arm.get_joint_positions()).values[5]
+            if j6_ref["v"] is None:
+                j6_ref["v"] = j6
+            elif args.max_j6_deg and abs(j6 - j6_ref["v"]) > args.max_j6_deg:
+                raise SystemExit(f"joint 6 has turned {j6 - j6_ref['v']:+.0f} deg since the start (limit {args.max_j6_deg:.0f}): stopping")
+
+        async def go_down(mm):
+            """Planned move straight down (world z) by mm, keeping the gripper's orientation."""
+            gp = await gripper_pose()
+            await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=at(np.array([gp.x, gp.y, gp.z - mm]), gp)))
+            await check_j6()
+
+        async def go_rel(v, touch_ok=False, obstacle_rel=None):
+            check_stop()
+            """Plan a move of v (mm, gripper frame) from where the gripper is now, keeping its orientation. The remembered object is
+            an obstacle for the planner. For the final advance (touch_ok) the fingers must straddle it, so the obstacle stays in the
+            world but the planner is told the claws may touch it (planner geometry names: 'gripper:claws' and the obstacle's label);
+            if the planner rejects that, the obstacle is left out for this step."""
+            p = (await robot.transform_pose(PoseInFrame(reference_frame=args.gripper, pose=Pose(x=float(v[0]), y=float(v[1]), z=float(v[2]))),
+                                            "world")).pose
+            goal = PoseInFrame(reference_frame="world", pose=Pose(x=p.x, y=p.y, z=max(p.z, args.min_z_mm), o_x=p.o_x, o_y=p.o_y, o_z=p.o_z, theta=p.theta))
+            ws = await object_obstacle(obstacle_rel)
+            allow = None
+            if touch_ok and ws is not None:
+                allow = Constraints(collision_specification=[CollisionSpecification(allows=[
+                    CollisionSpecification.AllowedFrameCollisions(frame1="gripper:claws", frame2=args.object)])])
+            try:
+                try:
+                    await motion.move(args.gripper, goal, world_state=ws, constraints=allow)
+                except Exception as e:
                     if allow is None or not ("collision" in str(e).lower() or "frame" in str(e).lower() or "name" in str(e).lower()):
                         raise
                     say("  the planner did not accept the claws/object exception: this step goes without the obstacle", flush=True)
                     await motion.move(args.gripper, goal, world_state=None)
             except Exception as e:
                 if "IK solution" in str(e) or "unreachable" in str(e) or "obstacle constraint" in str(e):
-                    say("  that step is not reachable / blocked: skipping it", flush=True)
+                    say(f"  that step is not reachable / blocked: skipping it ({str(e)[:160]})", flush=True)
                     return False
                 raise
             await check_j6()

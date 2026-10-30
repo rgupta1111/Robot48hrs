@@ -35,7 +35,7 @@ def _floats(value, n, default):
 
 
 class ObjectFollowService(Generic, EasyResource):
-    MODEL: ClassVar[Model] = Model(ModelFamily("REPLACE_NAMESPACE", "robot48hrs"), "object-follower")
+    MODEL: ClassVar[Model] = Model(ModelFamily("<ns>", "robot48hrs"), "object-follower")
 
     @classmethod
     def new(cls, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]) -> Self:
