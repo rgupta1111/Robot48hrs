@@ -337,6 +337,26 @@ async def main_async(args):
             await arm.move_to_joint_positions(JointPositions(values=j_here))
             return None
 
+        async def survey():
+            """No bottle in view at the start and no remembered position: look around. Sweep the base in 15-degree steps out to
+            +/-45 degrees, looking after each move; stop at the first bottle seen (nearest by depth in that view)."""
+            print("no bottle in view: looking around ...", flush=True)
+            j_here = list((await arm.get_joint_positions()).values)
+            for d in (15.0, -15.0, 30.0, -30.0, 45.0, -45.0):
+                j = list(j_here)
+                j[0] += d
+                await arm.move_to_joint_positions(JointPositions(values=j))
+                eye.lock.unlock()
+                eye.expected = None                          # nothing to match yet: take the nearest in this view
+                for _ in range(3):
+                    t, _ = await next_target(None, 0)
+                    if t:
+                        print(f"  found a {args.object} after turning the base {d:+.0f} deg", flush=True)
+                        return t
+                    await asyncio.sleep(0.2)
+            await arm.move_to_joint_positions(JointPositions(values=j_here))
+            return None
+
         # ---- look first (dry run: keep looking, so you can move the bottle and watch the target follow) ----
         tgt, misses, prev = None, 0, None
         for i in range(args.looks if not real else 5):
@@ -354,28 +374,30 @@ async def main_async(args):
                 print(f"[look {i + 1}] no {args.object} seen", flush=True)
             await asyncio.sleep(0.5)
         not_in_view = tgt is None
-        if not_in_view and (not real or eye.expected is None):
-            raise SystemExit(f"no {args.object} with a depth reading in view" + ("" if eye.expected is None else
-                             " (it is not visible from this pose; a real run will search for it)"))
-        known0 = eye.expected if not_in_view else tgt["world"]
-        reach = float(np.hypot(*known0[:2]))
-        print(f"the object is {reach:.0f} mm from the base axis (arm reach ~850 mm); width estimate {eye.width_estimate()} mm", flush=True)
-        if reach > 1000:
-            raise SystemExit(f"{reach:.0f} mm from the base axis: far beyond the arm's reach")
-        if reach > args.max_reach_mm:
-            print(f"warning: the world estimate ({reach:.0f} mm) is past {args.max_reach_mm:.0f} mm, but it shifts ~10 cm with the viewpoint; "
-                  "the approach is measured in the gripper frame and the motion planner refuses anything truly unreachable", flush=True)
+        known0 = (eye.expected if not_in_view else tgt["world"])      # None: nothing seen and nothing remembered
+        if not_in_view and not real:
+            raise SystemExit(f"no {args.object} with a depth reading in view (a real run would look around: sweep the base +/-45 deg)")
+        if known0 is not None:
+            reach = float(np.hypot(*known0[:2]))
+            print(f"the object is {reach:.0f} mm from the base axis (arm reach ~850 mm); width estimate {eye.width_estimate()} mm", flush=True)
+            if reach > 1000:
+                raise SystemExit(f"{reach:.0f} mm from the base axis: far beyond the arm's reach")
+            if reach > args.max_reach_mm:
+                print(f"warning: the world estimate ({reach:.0f} mm) is past {args.max_reach_mm:.0f} mm, but it shifts ~10 cm with the viewpoint; "
+                      "the approach is measured in the gripper frame and the motion planner refuses anything truly unreachable", flush=True)
         if not real:
             print("DRY RUN: nothing moved.")
             return
         if not confirm("The arm WILL make planned moves toward the nearest object, re-planning every step"
-                       + (" (it cannot see it from here, so it will first search nearby: back off, sweep the base)" if not_in_view else "")
+                       + ((" (it cannot see it from here, so it will first search nearby: back off, sweep the base)" if known0 is not None else
+                           " (no bottle in view, so it will first LOOK AROUND: sweep the base left and right, up to 45 degrees)")
+                          if not_in_view else "")
                        + ". E-stop in reach?"):
             return
         if not_in_view:
-            tgt = await reacquire(known0)
+            tgt = await (reacquire(known0) if known0 is not None else survey())
             if not tgt:
-                raise SystemExit("could not find the object by searching nearby; stopping")
+                raise SystemExit("could not find a " + args.object + " by looking around; stopping")
 
         # ---- stage A: approach the pre-grasp pose in short re-planned steps ----
         await gripper.do_command({"set": 840.0})
