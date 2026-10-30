@@ -283,7 +283,7 @@ async def main_async(args):
 
         # ---------------- optional web page (--ui): live view, status, chat commands, STOP ----------------
         loop = asyncio.get_running_loop()
-        flags = {"stop": False, "paused": False, "yes": None, "go": not args.ui}
+        flags = {"stop": False, "paused": False, "yes": None, "go": not args.ui, "grip": False}
         view = {"text": "starting", "state": "starting", "dist": None}
         ui = None
 
@@ -337,6 +337,9 @@ async def main_async(args):
                     if real:
                         asyncio.run_coroutine_threadsafe(arm.stop(), loop)
                     return "Stopped. Nothing else will move."
+                if t.startswith(("grip", "close", "gripper")) or "grip now" in t or "close now" in t:
+                    flags["grip"], flags["yes"] = True, True
+                    return "OK: closing the gripper now (skipping the rest of the advance and the checks)."
                 if t in ("yes", "y", "confirm", "ok", "go ahead"):
                     flags["yes"] = True
                     return "OK."
@@ -435,10 +438,17 @@ async def main_async(args):
             left out (a named collision exception failed: the planner did not know the obstacle by that name)."""
             p = (await robot.transform_pose(PoseInFrame(reference_frame=args.gripper, pose=Pose(x=float(v[0]), y=float(v[1]), z=float(v[2]))),
                                             "world")).pose
-            await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=Pose(
-                x=p.x, y=p.y, z=max(p.z, args.min_z_mm), o_x=p.o_x, o_y=p.o_y, o_z=p.o_z, theta=p.theta)),
-                world_state=None if touch_ok else await object_obstacle(obstacle_rel))
+            try:
+                await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=Pose(
+                    x=p.x, y=p.y, z=max(p.z, args.min_z_mm), o_x=p.o_x, o_y=p.o_y, o_z=p.o_z, theta=p.theta)),
+                    world_state=None if touch_ok else await object_obstacle(obstacle_rel))
+            except Exception as e:
+                if "IK solution" in str(e) or "unreachable" in str(e) or "obstacle constraint" in str(e):
+                    say("  that step is not reachable / blocked: skipping it", flush=True)
+                    return False
+                raise
             await check_j6()
+            return True
 
         async def next_target(prev, misses):
             """look; wait while a person is close; returns (target, misses)."""
@@ -911,7 +921,18 @@ async def main_async(args):
         eye.reset()
         peek = {"used": 0.0}
         misses, last = 0, memory.world if memory.world is not None else tgt["world"]
+        fails = 0
         for cycle in range(1, args.max_cycles + 1):
+            if flags["grip"]:                                     # you said "grip": the gripper is at the cup, stop advancing
+                break
+            if fails >= 3:                                        # it cannot plan any closer: ask the person instead of crashing
+                say("I cannot move any closer from here by myself. If the gripper is at the cup, say 'grip' to close now, or 'stop'.", flush=True)
+                t0 = time.monotonic()
+                while not flags["grip"] and not flags["stop"] and time.monotonic() - t0 < 120:
+                    check_stop()
+                    await asyncio.sleep(0.3)
+                fails = 0
+                continue
             t, misses = await next_target(last, misses)
             gp = await gripper_pose()
             gpos, axis = np.array([gp.x, gp.y, gp.z]), unit([gp.o_x, gp.o_y, gp.o_z])
@@ -937,19 +958,19 @@ async def main_async(args):
             cap = lambda v: float(np.clip(0.7 * v, -args.lat_step_mm, args.lat_step_mm))
             if lat > args.align_tol_mm:                    # ALIGN FIRST: sideways/vertical only, and stay clear of the object
                 back = max(args.clearance_mm - along, 0.0)
-                await go_rel(np.array([cap(rel[0]), cap(rel[1]), -back]), obstacle_rel=rel)
+                fails = 0 if await go_rel(np.array([cap(rel[0]), cap(rel[1]), -back]), obstacle_rel=rel) else fails + 1
                 say(f"[C {cycle}] aligning: {lat:.0f} mm off-axis, {along:.0f} mm ahead" + (f", backing off {back:.0f} mm" if back else "")
                       + ("" if t else " (out of view)"), flush=True)
                 continue
             if along <= hold + args.grasp_tol_mm:
                 break
             adv = min(args.step_mm, along - hold)
-            await go_rel(np.array([cap(rel[0]), cap(rel[1]), adv]), touch_ok=along <= args.clearance_mm + args.step_mm, obstacle_rel=rel)
+            fails = 0 if await go_rel(np.array([cap(rel[0]), cap(rel[1]), adv]), touch_ok=along <= args.clearance_mm + args.step_mm, obstacle_rel=rel) else fails + 1
             say(f"[C {cycle}] {along:.0f} mm along the axis, {lat:.0f} mm off to the side" + ("" if t else " (out of view)"), flush=True)
         else:
             raise SystemExit("did not reach the object within the cycle limit")
         # ---- re-check before closing: a person may have moved it ----
-        t, _ = await next_target(last, 0)
+        t, _ = (None, 0) if flags["grip"] else await next_target(last, 0)
         gp = await gripper_pose()
         gpos, axis = np.array([gp.x, gp.y, gp.z]), unit([gp.o_x, gp.o_y, gp.o_z])
         if t:
@@ -961,7 +982,7 @@ async def main_async(args):
         width = args.grip_width_mm or (None if eye.width_estimate() is None else eye.width_estimate() + args.grip_trim_mm)
         if width is None or not 25.0 <= width <= 80.0:
             raise SystemExit(f"cannot size the grip (estimated width {width}); pass --grip-width-mm. Not closing.")
-        if not await confirm(f"CLOSE the gripper to {width:.0f} mm (position {width * 10:.0f}, no force) and lift {args.lift_mm:.0f} mm."):
+        if not flags["grip"] and not await confirm(f"CLOSE the gripper to {width:.0f} mm (position {width * 10:.0f}, no force) and lift {args.lift_mm:.0f} mm."):
             return
         await gripper.do_command({"set_gripper_speed": 300})
         await gripper.do_command({"set": float(width * 10)})
