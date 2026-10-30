@@ -273,6 +273,13 @@ async def main_async(args):
             elif args.max_j6_deg and abs(j6 - j6_ref["v"]) > args.max_j6_deg:
                 raise SystemExit(f"joint 6 has turned {j6 - j6_ref['v']:+.0f} deg since the start (limit {args.max_j6_deg:.0f}): stopping")
 
+        async def go_down(mm):
+            """Planned move straight down (world z) by mm, keeping the gripper's orientation."""
+            gp = await gripper_pose()
+            await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=at(np.array([gp.x, gp.y, gp.z - mm]), gp)),
+                              world_state=object_obstacle())
+            await check_j6()
+
         async def go_rel(v, touch_ok=False):
             """Plan a move of v (mm, gripper frame) from where the gripper is now, keeping its orientation. The remembered object is
             an obstacle, except for the final advance (touch_ok), where the fingers must be allowed to straddle it."""
@@ -438,6 +445,7 @@ async def main_async(args):
         if not confirm("ADVANCE along the gripper axis onto the object (re-planned every step), then CLOSE and lift."):
             return
         eye.reset()
+        peek = {"used": 0.0}
         misses, last = 0, memory.world if memory.world is not None else tgt["world"]
         for cycle in range(1, args.max_cycles + 1):
             t, misses = await next_target(last, misses)
@@ -452,6 +460,12 @@ async def main_async(args):
                 misses, last = 0, memory.world
                 gp = await gripper_pose()
                 gpos, axis = np.array([gp.x, gp.y, gp.z]), unit([gp.o_x, gp.o_y, gp.o_z])
+            if not t and peek["used"] < args.peek_down_mm:  # out of view: a level gripper looks straight ahead, over the bottle; lower and look again
+                step = min(10.0, args.peek_down_mm - peek["used"])
+                await go_down(step)
+                peek["used"] += step
+                print(f"[C {cycle}] object out of view: lowered {step:.0f} mm ({peek['used']:.0f}/{args.peek_down_mm:.0f}) to look for it again", flush=True)
+                continue
             rel = await rel_of(t, last)                    # gripper frame; dead-reckons from the last known spot when out of view
             along, lat = float(rel[2]), float(np.hypot(rel[0], rel[1]))
             if not t and lat > args.blind_lat_mm:          # the remembered position is implausibly far off the gripper axis
@@ -540,6 +554,8 @@ def main():
     ap.add_argument("--wrist-joint", type=int, default=0, help="joint that flattens the gripper (Viam app numbering); 0 = try 4 and 5 and pick "
                     "the one that works from the current pose (never 6)")
     ap.add_argument("--wrist-deg", type=float, default=90.0)
+    ap.add_argument("--peek-down-mm", type=float, default=20.0, help="when the object is out of view in the final stage, lower the gripper "
+                    "in 10 mm steps by up to this much and look again (a level gripper looks straight ahead, over the object)")
     ap.add_argument("--max-j6-deg", type=float, default=0.0, help="stop if joint 6 (final roll) turns more than this from where the run began (0 = no limit)")
     ap.add_argument("--wrist-sign", type=int, choices=[-1, 0, 1], default=0)
     ap.add_argument("--lift-mm", type=float, default=120.0)
