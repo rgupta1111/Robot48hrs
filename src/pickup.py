@@ -24,7 +24,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from arm_mimic import PRESETS, floats  # noqa: E402
-from mimic.pickup import PickupConfig, PickupPlanner  # noqa: E402
+from mimic.pickup import PickupConfig, PickupPlanner, check_jacobian  # noqa: E402
 from mimic.servo import estimate_jacobian, features  # noqa: E402
 from mimic.ui import UIServer  # noqa: E402
 from mimic.size import WidthEstimator, grip_position, scale_focal  # noqa: E402
@@ -51,6 +51,8 @@ def main():
     ap.add_argument("--object-height-mm", type=float, default=100.0)
     ap.add_argument("--segmenter", help="Viam vision service that gives 3D object positions (e.g. object-segmenter); "
                     "its depth gives the true camera-to-object distance and lets the width be estimated")
+    ap.add_argument("--arm-speed", type=float, default=30.0,
+                    help="real arm joint speed in deg/s, set over DoCommand when a run starts (UFactory: 15 slow, 30 medium, 60 fast)")
     ap.add_argument("--max-torque", type=int, default=30, help="grip force limit 1-100%% (UFactory G2 gripper only)")
     ap.add_argument("--grip-speed", type=int, default=1500)
     ap.add_argument("--units-per-mm", type=float, default=10.0, help="gripper position units per mm of opening (check it)")
@@ -158,8 +160,13 @@ def main():
         """Close onto the object with just enough squeeze: to the estimated width, force-limited where supported."""
         r = widthest.reading() if widthest else None
         if r is None:
-            print("no width estimate (need --segmenter and camera intrinsics): plain close at the gripper's default force")
+            print("no width estimate (need --segmenter and camera intrinsics): plain close, force capped at "
+                  f"{args.max_torque}% where the gripper supports it")
             if not dry and confirm("About to CLOSE the gripper."):
+                try:   # UFactory G2 only; a G1 has no force setting, so this just fails and the close is unlimited
+                    robot.gripper_command({"set_gripper_torque": args.max_torque})
+                except Exception as e:
+                    print(f"could not cap the grip force ({type(e).__name__}: {e}); closing at the default force")
                 robot.set_gripper(False)
             return
         if not args.min_width_mm <= r.width_mm <= args.max_width_mm:
@@ -178,25 +185,44 @@ def main():
             robot.gripper_command({"set": pos})
 
     def probe():
-        """Learn how the object's image features respond to moving +x, +y, +z (then undo each move)."""
-        s0 = [see()[0] for _ in range(3)]
-        s0 = [s for s in s0 if s is not None]
-        if not s0:
-            raise SystemExit("probe: object not visible")
-        s0, after = np.mean(s0, axis=0), []
+        """Learn how the object's image features respond to moving +x, +y, +z. Each axis is measured against a fresh
+        at-rest reading, and the arm is sent back to the exact start position (absolute, not 'minus the move') so
+        clamping or positioning error cannot build up from one probe to the next."""
+        def at_rest(n=5):
+            got = []
+            for _ in range(n):
+                s_, _ = see()
+                if s_ is not None:
+                    got.append(s_)
+                time.sleep(0.15)
+            return np.median(got, axis=0) if len(got) >= n - 1 else None
+
+        start = position()
+        J = np.zeros((3, 3))
         for i in range(3):
+            before = at_rest()
+            if before is None:
+                raise SystemExit("probe: cannot see the object steadily; get it in view and keep it still")
             d = np.zeros(3)
-            d[i] = args.probe_mm
-            move_by(d)
-            s, _ = see()
-            move_by(-d)
-            if s is None:
+            for sign in (1.0, -1.0):                        # move away from a bound if there is no room this way
+                d[i] = sign * args.probe_mm
+                if abs(np.clip(start + d, lo, hi)[i] - start[i]) >= 5.0:
+                    break
+            else:
+                raise SystemExit(f"probe: no room to move along axis {'xyz'[i]} inside the bounds")
+            target = np.clip(start + d, lo, hi)
+            robot.move_xyz(*target, wait=True)
+            time.sleep(args.settle + 0.4)                   # let the arm stop and the camera catch up
+            after = at_rest()
+            robot.move_xyz(*start, wait=True)
+            time.sleep(args.settle + 0.4)
+            if after is None:
                 raise SystemExit("probe: lost the object during a probe move; centre it in view first")
-            after.append(s)
-        J = estimate_jacobian(s0, after, [args.probe_mm] * 3)
+            J[:, i] = (after - before) / (target - start)[i]
         print("learned image response J (per mm):\n", np.round(J, 5))
-        if np.abs(J[:2]).max() < 1e-5:
-            raise SystemExit("probe: the object did not move in the image; cannot servo")
+        problem = check_jacobian(J)
+        if problem:
+            raise SystemExit("probe rejected: " + problem + ". The arm was returned to its start; nothing else moved.")
         return J
 
     ui = None
@@ -301,6 +327,11 @@ def main():
                 if real:
                     if not ui and not confirm(f"The arm WILL move to pick up '{args.object}' (bounds {bounds}). E-stop in reach?"):
                         return
+                    try:
+                        robot.arm_command({"set_speed": args.arm_speed})
+                        print(f"arm speed set to {args.arm_speed:.0f} deg/s", flush=True)
+                    except Exception as e:
+                        print(f"could not set the arm speed ({type(e).__name__}: {e}); using the configured speed", flush=True)
                     if ui:
                         ui.say("Learning how the camera responds: three small probe moves (about 20 mm each).")
                     try:

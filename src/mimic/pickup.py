@@ -33,15 +33,29 @@ class Action:
     note: str = ""
 
 
+def check_jacobian(J, min_response=1e-4, min_ratio=0.2):
+    """Sanity-check a learned image response before servoing with it. -> an error message, or None when usable.
+    Moving the gripper in x and y must shift the object differently in the image: if the x and y columns point the
+    same way (or barely respond) the probe was dominated by noise or drift and servoing on it would drive off."""
+    sv = np.linalg.svd(np.asarray(J, float)[:2, :2], compute_uv=False)
+    if sv[0] < min_response:
+        return "the object barely moved in the image during the probe moves"
+    if sv[1] < min_ratio * sv[0]:
+        return "moving x and y shifted the object the same way (probe unreliable: drift or a stale frame)"
+    return None
+
+
 class PickupPlanner:
     def __init__(self, J, cfg=None):
         self.J, self.cfg = np.asarray(J, float), cfg or PickupConfig()
-        self.state, self.cycles, self.lost = "OPEN", 0, 0
+        self.state, self.cycles, self.lost, self._errs = "OPEN", 0, 0, []
 
     def _centre_move(self, s):
         c = self.cfg
         target = np.array([c.target_uv[0], c.target_uv[1], s[2]])
-        return servo_step(self.J, s, target, (0, 1), c.gain, c.max_step_mm)
+        Jxy = self.J.copy()
+        Jxy[:, 2] = 0.0                  # centre with x / y only: height is the descent's job, never the centring's
+        return servo_step(Jxy, s, target, (0, 1), c.gain, c.max_step_mm)
 
     def step(self, s, dist_mm):
         """s: (u, v, h) or None when the object is not seen. -> Action."""
@@ -68,6 +82,9 @@ class PickupPlanner:
         s = np.asarray(s, float)
         err = np.array(c.target_uv) - s[:2]
         centred = bool(np.max(np.abs(err)) < c.centre_tol)
+        self._errs = (self._errs + [float(np.max(np.abs(err)))])[-5:]
+        if len(self._errs) == 5 and all(b > a + 0.005 for a, b in zip(self._errs, self._errs[1:])):
+            return self._abort("image error keeps growing: moving the wrong way")
 
         if self.state == "CENTRE":
             if centred:

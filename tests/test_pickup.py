@@ -1,6 +1,6 @@
 import numpy as np
 
-from mimic.pickup import PickupConfig, PickupPlanner
+from mimic.pickup import PickupConfig, PickupPlanner, check_jacobian
 
 J = np.array([[0.0, -0.004, 0.0], [-0.003, 0.0, 0.0], [0.0, 0.0, 0.001]])
 
@@ -59,3 +59,24 @@ def test_max_cycles_aborts():
     p.step((0, 0, 0.2), 500)
     p.step((0, 0, 0.2), 500)
     assert p.step((0, 0, 0.2), 500).kind == "abort"
+
+
+def test_centring_never_moves_z():
+    p = PickupPlanner(np.array([[-0.001, 0.0003, -0.0008], [-0.004, -0.0048, -0.0048], [0.008, 0.0085, 0.0085]]),
+                      PickupConfig(max_step_mm=1000))
+    p.step((0, 0, 0.2), 500)
+    assert p.step((0.2, 0.3, 0.2), 500).move[2] == 0.0
+
+
+def test_check_jacobian_rejects_the_bad_probe_from_the_real_run_and_accepts_a_good_one():
+    bad = np.array([[-0.00088, 0.00033, -0.00078], [-0.00396, -0.00476, -0.00479], [0.00792, 0.00854, 0.00847]])
+    assert check_jacobian(bad) is not None
+    assert check_jacobian(J) is None
+    assert check_jacobian(np.zeros((3, 3))) is not None
+
+
+def test_aborts_when_the_image_error_keeps_growing():
+    p = PickupPlanner(J, PickupConfig(max_step_mm=1000))
+    p.step((0, 0, 0.2), 500)
+    acts = [p.step((0.0, 0.3 + 0.03 * i, 0.2), 500) for i in range(6)]
+    assert p.state == "ABORT" and any("growing" in a.note for a in acts)

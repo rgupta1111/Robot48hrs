@@ -270,6 +270,10 @@ class ViamRobot:
         if self.gripper is not None:
             self._run(self.gripper.open() if is_open else self.gripper.grab())
 
+    def arm_command(self, command):
+        """Arm DoCommand (model-specific, e.g. the UFactory {"set_speed": deg_per_s})."""
+        return self._run(self.arm.do_command(command))
+
     def gripper_command(self, command):
         """Gripper DoCommand (model-specific, e.g. the UFactory {"set": pos} / {"grab_with_torque": {...}})."""
         if self.gripper is None:
