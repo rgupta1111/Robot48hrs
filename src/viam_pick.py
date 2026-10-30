@@ -1017,7 +1017,8 @@ def main():
     ap.add_argument("--wrist-joint", type=int, default=0, help="joint that flattens the gripper (Viam app numbering); 0 = try 4 and 5 and pick "
                     "the one that works from the current pose (never 6)")
     ap.add_argument("--roll-joint", type=int, default=6, help="the final roll joint, Viam app numbering (6)")
-    ap.add_argument("--roll-target-deg", type=float, default=-358.0, help="roll joint angle for the pick: -360 in the taught pick pose (jaws sideways); -358 stays inside the joint limit")
+    ap.add_argument("--roll-target-deg", type=float, default=0.0, help="roll joint (6) angle for the pick: 0 (the same gripper roll as -360, turned the other way: "
+                    "mid-range, so far from the joint limits)")
     ap.add_argument("--roll-tol-deg", type=float, default=10.0, help="leave the roll alone if it is already within this of the target")
     ap.add_argument("--wrist-deg", type=float, default=100.0)
     ap.add_argument("--peek-down-mm", type=float, default=20.0, help="when the object is out of view in the final stage, lower the gripper "
