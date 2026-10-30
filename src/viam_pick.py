@@ -253,13 +253,16 @@ async def main_async(args):
                                                                                            z=float(known_world[2]))), args.gripper)).pose
             return np.array([p.x, p.y, p.z])
 
-        def object_obstacle():
-            """The remembered object as a box obstacle for the planner (so planned moves go around it), or None until its size is known."""
-            if memory.world is None:
+        async def object_obstacle(rel):
+            """The object as a box obstacle for the planner, placed from the SAME gripper-frame measurement that drives the move (so the
+            two always agree; the remembered world position can differ from it by ~10 cm). None if there is no measurement."""
+            if rel is None:
                 return None
-            wd, ht = memory.width or 90.0, memory.height or 220.0      # defaults when its size is not known yet (e.g. its box was clipped)
-            g = Geometry(center=Pose(x=float(memory.world[0]), y=float(memory.world[1]), z=float(memory.world[2])),
-                         box=RectangularPrism(dims_mm=Vector3(x=wd + 30, y=wd + 30, z=ht + 30)), label=args.object)
+            wp = (await robot.transform_pose(PoseInFrame(reference_frame=args.gripper, pose=Pose(x=float(rel[0]), y=float(rel[1]),
+                                                                                                 z=float(rel[2]))), "world")).pose
+            wd, ht = memory.width or 90.0, memory.height or 220.0      # defaults when its size is not known (its box was clipped)
+            g = Geometry(center=Pose(x=wp.x, y=wp.y, z=wp.z), box=RectangularPrism(dims_mm=Vector3(x=wd + 10, y=wd + 10, z=ht + 10)),
+                         label=args.object)
             return WorldState(obstacles=[GeometriesInFrame(reference_frame="world", geometries=[g])])
 
         j6_ref = {"v": None}
@@ -276,11 +279,10 @@ async def main_async(args):
         async def go_down(mm):
             """Planned move straight down (world z) by mm, keeping the gripper's orientation."""
             gp = await gripper_pose()
-            await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=at(np.array([gp.x, gp.y, gp.z - mm]), gp)),
-                              world_state=object_obstacle())
+            await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=at(np.array([gp.x, gp.y, gp.z - mm]), gp)))
             await check_j6()
 
-        async def go_rel(v, touch_ok=False):
+        async def go_rel(v, touch_ok=False, obstacle_rel=None):
             """Plan a move of v (mm, gripper frame) from where the gripper is now, keeping its orientation. The remembered object is
             an obstacle for the planner, except for the final advance (touch_ok), where the fingers must straddle it: then it is
             left out (a named collision exception failed: the planner did not know the obstacle by that name)."""
@@ -288,7 +290,7 @@ async def main_async(args):
                                             "world")).pose
             await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=Pose(
                 x=p.x, y=p.y, z=max(p.z, args.min_z_mm), o_x=p.o_x, o_y=p.o_y, o_z=p.o_z, theta=p.theta)),
-                world_state=None if touch_ok else object_obstacle())
+                world_state=None if touch_ok else await object_obstacle(obstacle_rel))
             await check_j6()
 
         async def next_target(prev, misses):
@@ -480,7 +482,7 @@ async def main_async(args):
             if np.linalg.norm(pre_g) < args.tol_mm:
                 print("at the pre-grasp pose", flush=True)
                 break
-            await go_rel(unit(pre_g) * min(np.linalg.norm(pre_g), args.step_mm))
+            await go_rel(unit(pre_g) * min(np.linalg.norm(pre_g), args.step_mm), obstacle_rel=rel)
             print(f"[A {cycle}] {np.linalg.norm(pre_g):.0f} mm to the pre-grasp pose; object {rel[2]:.0f} mm ahead, {np.hypot(rel[0], rel[1]):.0f} mm off-axis"
                   + ("" if tgt else " (last known: out of view)"), flush=True)
         else:
@@ -532,14 +534,14 @@ async def main_async(args):
             cap = lambda v: float(np.clip(0.7 * v, -args.lat_step_mm, args.lat_step_mm))
             if lat > args.align_tol_mm:                    # ALIGN FIRST: sideways/vertical only, and stay clear of the object
                 back = max(args.clearance_mm - along, 0.0)
-                await go_rel(np.array([cap(rel[0]), cap(rel[1]), -back]))
+                await go_rel(np.array([cap(rel[0]), cap(rel[1]), -back]), obstacle_rel=rel)
                 print(f"[C {cycle}] aligning: {lat:.0f} mm off-axis, {along:.0f} mm ahead" + (f", backing off {back:.0f} mm" if back else "")
                       + ("" if t else " (out of view)"), flush=True)
                 continue
             if along <= args.hold_mm + args.tol_mm:
                 break
             adv = min(args.step_mm, along - args.hold_mm)
-            await go_rel(np.array([cap(rel[0]), cap(rel[1]), adv]), touch_ok=along <= args.clearance_mm + args.step_mm)
+            await go_rel(np.array([cap(rel[0]), cap(rel[1]), adv]), touch_ok=along <= args.clearance_mm + args.step_mm, obstacle_rel=rel)
             print(f"[C {cycle}] {along:.0f} mm along the axis, {lat:.0f} mm off to the side" + ("" if t else " (out of view)"), flush=True)
         else:
             raise SystemExit("did not reach the object within the cycle limit")
