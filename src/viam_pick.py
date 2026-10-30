@@ -773,10 +773,17 @@ async def main_async(args):
             say(f"  nearest: seen at joint {args.survey_joint} {d:+.0f} deg; returning to the reset pose to start the pick", flush=True)
             await arm.move_to_joint_positions(JointPositions(values=list(RESET_JOINTS)))     # the whole reset pose, not a mix of poses
             eye.lock.unlock()
-            eye.widths, eye.heights = [], []                      # start fresh on the chosen object (the sweep mixed several)
-            memory.world, memory.first_world = chosen["world"].copy(), chosen["world"].copy()   # its position as seen from the vertical view
-            memory.width, memory.height, memory.weight, memory.sightings = None, None, 1e-6, 0
-            eye.expected = chosen["world"]
+            # COMMIT the chosen object to memory: position, size and distance from the sweep sighting, kept for the whole run and saved to the
+            # file. The sweep mixed several objects, so everything is replaced by this one's.
+            wmm, hmm = chosen.get("width_mm"), chosen.get("height_mm")
+            eye.widths, eye.heights = ([wmm] * 3 if wmm else []), ([hmm] * 3 if hmm else [])    # seeds the size estimates too
+            memory.world, memory.first_world = chosen["world"].copy(), chosen["world"].copy()
+            memory.width, memory.height = wmm, hmm
+            memory.weight, memory.sightings, memory.last_seen = 1.0 / max(chosen["depth_mm"], 100.0) ** 2, 1, time.time()
+            memory.save()
+            eye.expected = memory.world
+            say(f"  committed the {eye.label} to memory: world x{memory.world[0]:.0f} y{memory.world[1]:.0f} z{memory.world[2]:.0f} mm, "
+                f"{chosen['depth_mm'] / 10:.0f} cm from the camera, ~{(wmm or 0):.0f} wide x {(hmm or 0):.0f} tall mm (saved to {os.path.basename(args.memory_file)})", flush=True)
             for _ in range(3):
                 t, _ = await next_target(None, 0)
                 if t:
