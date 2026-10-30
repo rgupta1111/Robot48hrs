@@ -10,3 +10,5 @@ cffi
 sounddevice
 certifi
 matplotlib
+ultralytics>=8.4   # local YOLO detection (src/local_detect.py); weights are linked under weights/
+lap>=0.5.12        # ultralytics tracker dependency
