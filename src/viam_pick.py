@@ -937,7 +937,7 @@ async def main_async(args):
         await gripper.do_command({"set_gripper_speed": 300})
         await gripper.do_command({"set": float(width * 10)})
         await asyncio.sleep(2.5)
-        say("gripper position:", await gripper.do_command({"get": True}), flush=True)
+        say(f"gripper position: {await gripper.do_command({'get': True})}", flush=True)
         gp = await gripper_pose()
         await go(np.array([gp.x, gp.y, gp.z + args.lift_mm]), gp)
         say("lifted.")
