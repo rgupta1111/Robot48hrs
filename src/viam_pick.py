@@ -1227,7 +1227,8 @@ async def main_async(args):
             if not t and lat > args.blind_lat_mm:          # the remembered position is implausibly far off the gripper axis
                 raise SystemExit(f"the remembered object is {lat:.0f} mm off the gripper axis (> {args.blind_lat_mm:.0f}): the memory looks wrong; stopping.")
             cap = lambda v: float(np.clip(0.7 * v, -args.lat_step_mm, args.lat_step_mm))
-            if lat > args.align_tol_mm:                    # ALIGN FIRST: sideways/vertical only, and stay clear of the object
+            tol = args.centre_tol_mm if (t and args.clearance_mm <= along <= args.centre_at_mm) else args.align_tol_mm      # tighter once the cup is close but still in view
+            if lat > tol:                                  # ALIGN FIRST: sideways/vertical only, and stay clear of the object
                 back = max(args.clearance_mm - along, 0.0)
                 fails = 0 if await go_rel(np.array([cap(rel[0]), cap(rel[1]), -back]), obstacle_rel=rel) else fails + 1
                 say(f"[C {cycle}] aligning: {lat:.0f} mm off-axis, {along:.0f} mm ahead" + (f", backing off {back:.0f} mm" if back else "")
@@ -1418,6 +1419,9 @@ def main():
                     "constant aiming error (x = along the jaw opening, y = the other sideways axis, z = along the gripper axis)")
     ap.add_argument("--recentre-tol-mm", type=float, default=6.0, help="before closing, centre the cup between the jaws to within this")
     ap.add_argument("--recentre-tries", type=int, default=4)
+    ap.add_argument("--centre-tol-mm", type=float, default=10.0, help="while the cup is in view and within --centre-at-mm, line up to within this "
+                    "before going in (looser --align-tol-mm farther out)")
+    ap.add_argument("--centre-at-mm", type=float, default=280.0)
     ap.add_argument("--retries", type=int, default=2, help="after a failed grasp, start the whole pick again this many times (each retry is confirmed)")
     ap.add_argument("--no-grasp-check", dest="grasp_check", action="store_false", help="do not verify the grasp (fingers closed, cup left the table)")
     ap.add_argument("--open-pos", type=float, default=840.0, help="gripper position units when fully open (10 per mm)")
