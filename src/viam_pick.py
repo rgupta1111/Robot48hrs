@@ -261,7 +261,7 @@ class Perceiver:
         dets = await asyncio.to_thread(detect, self.model, color, self.dargs)
         best = None
         for d in dets:
-            if d[5] != "person":
+            if d[5] != "person" or d[4] < self.person_conf or (d[3] - d[1]) < self.person_min_px:
                 continue
             z = box_depth_mm(dmap, d[:4])
             if z and (best is None or z < best[0]):
@@ -729,10 +729,56 @@ async def main_async(args):
             await arm.move_to_joint_positions(JointPositions(values=list(RESET_JOINTS)))
             raise GraspFailed(f"grasp failed: {why}")
 
+        async def scan_for_person():
+            """Holding the object, bring it in close to the base and pan the base (joint 1) left and right in --scan-step-deg steps out to
+            +/- --scan-deg, looking for a person at each stop (centre first). Returns the first person's world position, or None. Slow, and the
+            person confirms it first. The pan returns to the start afterwards."""
+            if not await confirm(f"SCAN for a person: bring the {eye.label} in to {args.scan_radius_mm:.0f} mm from the base at z {args.handover_z_mm:.0f}, "
+                                 f"then pan the base up to +/-{args.scan_deg:.0f} deg looking for you."):
+                return None
+            try:
+                await arm.do_command({"set_speed": float(args.handover_speed_dps)})
+            except Exception:
+                pass
+            try:
+                gp = await gripper_pose()
+                d0 = unit([gp.x, gp.y, 0.0])
+                await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=at(np.array([d0[0] * args.scan_radius_mm, d0[1] * args.scan_radius_mm,
+                                                                                               args.handover_z_mm]), gp)))
+                await check_j6()
+                j0 = list((await arm.get_joint_positions()).values)
+                offsets = [0.0] + [a_ * sg for a_ in np.arange(args.scan_step_deg, args.scan_deg + 1e-6, args.scan_step_deg) for sg in (1.0, -1.0)]
+                found = None
+                for off in offsets:
+                    check_stop()
+                    j = list(j0)
+                    j[0] += off
+                    await arm.move_to_joint_positions(JointPositions(values=j))
+                    await asyncio.sleep(0.6)
+                    for _ in range(2):
+                        found = await eye.person_world()
+                        if found is not None:
+                            break
+                    say(f"  scan base {off:+.0f} deg: " + ("person found" if found is not None else "nobody"), flush=True)
+                    if found is not None:
+                        break
+                if found is None:
+                    await arm.move_to_joint_positions(JointPositions(values=j0))
+                return found
+            finally:
+                try:
+                    await arm.do_command({"set_speed": float(args.arm_speed_dps)})
+                except Exception:
+                    pass
+
         async def hand_over():
             """Give the object to a person: hold it out toward the nearest person (or at --handover-xyz), wait until they take it (a pull
             on the arm, or 'release' / 'yes' in the chat), then open the gripper and back away."""
-            person = await eye.person_world()
+            person = None
+            if args.scan_person:
+                person = await scan_for_person()
+            if person is None:
+                person = await eye.person_world()
             if person is not None:
                 reach_dir = unit([person[0], person[1], 0.0])
                 radius = float(np.clip(np.hypot(person[0], person[1]) - args.handover_gap_mm, 350.0, args.handover_max_reach_mm))
@@ -1333,6 +1379,10 @@ def main():
     ap.add_argument("--centre-at-mm", type=float, default=280.0)
     ap.add_argument("--person-conf", type=float, default=0.55, help="a 'person' detection below this confidence does not pause the arm")
     ap.add_argument("--person-min-px", type=float, default=160.0, help="...nor one whose box is shorter than this many pixels")
+    ap.add_argument("--scan-person", action="store_true", help="after lifting, pan the base (holding the object) to look for a person before handing over")
+    ap.add_argument("--scan-deg", type=float, default=90.0)
+    ap.add_argument("--scan-step-deg", type=float, default=30.0)
+    ap.add_argument("--scan-radius-mm", type=float, default=500.0, help="distance from the base axis to bring the object in to before scanning")
     ap.add_argument("--retries", type=int, default=2, help="after a failed grasp, start the whole pick again this many times (each retry is confirmed)")
     ap.add_argument("--no-grasp-check", dest="grasp_check", action="store_false", help="do not verify the grasp (fingers closed, cup left the table)")
     ap.add_argument("--open-pos", type=float, default=840.0, help="gripper position units when fully open (10 per mm)")
