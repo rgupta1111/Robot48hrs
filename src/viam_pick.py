@@ -35,7 +35,6 @@ from viam.components.gripper import Gripper  # noqa: E402
 from viam.proto.common import Geometry, GeometriesInFrame, Pose, PoseInFrame, RectangularPrism, Vector3, WorldState  # noqa: E402
 from viam.robot.client import RobotClient  # noqa: E402
 from viam.rpc.dial import DialOptions  # noqa: E402
-from viam.proto.service.motion import CollisionSpecification, Constraints  # noqa: E402
 from viam.services.motion import MotionClient  # noqa: E402
 
 from local_detect import Lock, detect, load_detector, object_candidates  # noqa: E402
@@ -256,10 +255,11 @@ async def main_async(args):
 
         def object_obstacle():
             """The remembered object as a box obstacle for the planner (so planned moves go around it), or None until its size is known."""
-            if memory.world is None or not memory.width or not memory.height:
+            if memory.world is None:
                 return None
+            wd, ht = memory.width or 90.0, memory.height or 220.0      # defaults when its size is not known yet (e.g. its box was clipped)
             g = Geometry(center=Pose(x=float(memory.world[0]), y=float(memory.world[1]), z=float(memory.world[2])),
-                         box=RectangularPrism(dims_mm=Vector3(x=memory.width + 30, y=memory.width + 30, z=memory.height + 30)), label=args.object)
+                         box=RectangularPrism(dims_mm=Vector3(x=wd + 30, y=wd + 30, z=ht + 30)), label=args.object)
             return WorldState(obstacles=[GeometriesInFrame(reference_frame="world", geometries=[g])])
 
         j6_ref = {"v": None}
@@ -282,14 +282,13 @@ async def main_async(args):
 
         async def go_rel(v, touch_ok=False):
             """Plan a move of v (mm, gripper frame) from where the gripper is now, keeping its orientation. The remembered object is
-            an obstacle, except for the final advance (touch_ok), where the fingers must be allowed to straddle it."""
+            an obstacle for the planner, except for the final advance (touch_ok), where the fingers must straddle it: then it is
+            left out (a named collision exception failed: the planner did not know the obstacle by that name)."""
             p = (await robot.transform_pose(PoseInFrame(reference_frame=args.gripper, pose=Pose(x=float(v[0]), y=float(v[1]), z=float(v[2]))),
                                             "world")).pose
-            allow = Constraints(collision_specification=[CollisionSpecification(allows=[
-                CollisionSpecification.AllowedFrameCollisions(frame1=args.gripper, frame2=args.object)])]) if touch_ok else None
             await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=Pose(
                 x=p.x, y=p.y, z=max(p.z, args.min_z_mm), o_x=p.o_x, o_y=p.o_y, o_z=p.o_z, theta=p.theta)),
-                world_state=object_obstacle(), constraints=allow)
+                world_state=None if touch_ok else object_obstacle())
             await check_j6()
 
         async def next_target(prev, misses):
