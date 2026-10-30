@@ -322,6 +322,9 @@ async def main_async(args):
                         print(f"  found it again after backing off {retreat:.0f} mm", flush=True)
                         return t
                     await asyncio.sleep(0.2)
+            t = await wrist_scan()
+            if t:
+                return t
             j_here = list((await arm.get_joint_positions()).values)
             for d in (6.0, -6.0, 12.0, -12.0):             # base yaw sweep, bounded to +/-12 degrees
                 j = list(j_here)
@@ -334,6 +337,27 @@ async def main_async(args):
                         print(f"  found it again after turning the base {d:+.0f} deg", flush=True)
                         return t
                     await asyncio.sleep(0.2)
+            await arm.move_to_joint_positions(JointPositions(values=j_here))
+            return None
+
+        async def wrist_scan():
+            """Look around by moving ONLY the two wrist joints (4 and 5), which pan/tilt the camera a little each way, looking after every
+            pose. Returns a target (the arm stays where it saw it) or None (the wrist is put back where it was)."""
+            j_here = list((await arm.get_joint_positions()).values)
+            print("  scanning with the wrist (joints 4 and 5) ...", flush=True)
+            for d4, d5 in ((0, 10), (0, -10), (10, 0), (-10, 0), (10, 10), (10, -10), (-10, 10), (-10, -10),
+                           (0, 20), (0, -20), (20, 0), (-20, 0)):
+                j = list(j_here)
+                j[3] += d4
+                j[4] += d5
+                await arm.move_to_joint_positions(JointPositions(values=j))
+                eye.lock.unlock()
+                for _ in range(2):
+                    t, _ = await next_target(None, 0)
+                    if t:
+                        print(f"  found a {args.object} with the wrist at joint 4 {d4:+d}, joint 5 {d5:+d} deg", flush=True)
+                        return t
+                    await asyncio.sleep(0.15)
             await arm.move_to_joint_positions(JointPositions(values=j_here))
             return None
 
@@ -377,6 +401,9 @@ async def main_async(args):
                     await flatten()
                 except SystemExit as e:
                     print(f"  (could not level the gripper for the survey: {e})", flush=True)
+            t = await wrist_scan()
+            if t:
+                return t
             j_here = list((await arm.get_joint_positions()).values)
             for d in (15.0, -15.0, 30.0, -30.0, 45.0, -45.0):
                 j = list(j_here)
@@ -426,7 +453,7 @@ async def main_async(args):
             return
         if not confirm("The arm WILL make planned moves toward the nearest object, re-planning every step"
                        + ((" (it cannot see it from here, so it will first search nearby: back off, sweep the base)" if known0 is not None else
-                           " (no bottle in view, so it will first LOOK AROUND: level the gripper with joints 4/5 if it is not level, then sweep the base left and right, up to 45 degrees)")
+                           " (no bottle in view, so it will first LOOK AROUND: level the gripper with joints 4/5 if needed, scan with the wrist (joints 4 and 5), then sweep the base left and right, up to 45 degrees)")
                           if not_in_view else "")
                        + ". E-stop in reach?"):
             return
