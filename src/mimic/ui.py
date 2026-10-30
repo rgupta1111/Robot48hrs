@@ -32,12 +32,14 @@ button{padding:9px 14px;border-radius:8px;border:1px solid var(--line);backgroun
 button.send{background:var(--acc);border-color:var(--acc);color:#fff}
 .chips{display:flex;flex-wrap:wrap;gap:6px;padding:0 10px 10px}.chips button{font-size:13px;padding:5px 10px;border-radius:99px}
 #stop{background:var(--bad);border-color:var(--bad);color:#fff;font-weight:700;padding:11px 20px}
+#mcqbox{display:none;padding:12px 14px;border-bottom:1px solid var(--line);background:var(--bg)}#q{font-weight:600;margin-bottom:8px}#mcq{display:flex;flex-wrap:wrap;gap:10px}
+button.mcq{font-size:17px;font-weight:600;padding:14px 26px;border-radius:10px;border:2px solid var(--acc);background:var(--card);color:var(--acc)}button.mcq:hover{background:var(--acc);color:#fff}
 .side{display:flex;flex-direction:column;gap:12px;min-height:0}
 </style></head><body><main>
 <div class="side"><div class="card"><div class="video"><img id="cam" alt="camera"><span id="mode" class="badge dry">DRY RUN</span></div>
 <div class="stats" id="stats"></div></div>
 <button id="stop">STOP ARM</button></div>
-<div class="card"><div id="log"></div>
+<div class="card"><div id="mcqbox"><div id="q"></div><div id="mcq"></div></div><div id="log"></div>
 <div class="chips" id="chips"></div>
 <form id="f"><input id="t" autocomplete="off" placeholder="e.g. go to the cup" autofocus><button class="send">Send</button></form></div>
 </main><script>
@@ -53,6 +55,9 @@ async function poll(){try{
  const m=await (await fetch('/messages?after='+last)).json();for(const x of m.messages){add(x.who,x.text);last=x.id}
  const s=await (await fetch('/status')).json();const mode=document.getElementById('mode');mode.textContent=s.mode;mode.className='badge '+(s.mode==='LIVE ARM'?'live':'dry');
  const f=(k,v)=>v===undefined||v===null||v===''?'':`<span>${k} <b>${v}</b></span>`;
+ {const ch=s.choices||[],key=JSON.stringify([s.question,ch]),box=document.getElementById('mcqbox'),mq=document.getElementById('mcq');
+ if(box.dataset.k!==key){box.dataset.k=key;box.style.display=ch.length?'block':'none';document.getElementById('q').textContent=s.question||'';mq.innerHTML='';
+  for(const o of ch){const b=document.createElement('button');b.textContent=o.label;b.className='mcq';b.onclick=()=>send(o.send);mq.appendChild(b)}}}
  document.getElementById('stats').innerHTML=f('target',s.target)+f('state',s.state)+f('distance',s.distance)+f('stop at',s.stop_at)+f('cam fps',s.cam_fps)+f('detector fps',s.det_fps)
 }catch(e){}setTimeout(poll,500)}poll();
 </script></body></html>"""

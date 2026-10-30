@@ -376,9 +376,11 @@ async def main_async(args):
             if ui:
                 flags["yes"] = None
                 say(q + " Reply 'yes' to continue or 'no' to cancel.")
+                view["question"], view["choices"] = q[:160], [{"label": "Yes", "send": "yes"}, {"label": "No", "send": "no"}]
                 t0 = time.monotonic()
                 while flags["yes"] is None and not flags["stop"] and time.monotonic() - t0 < 120:
                     await asyncio.sleep(0.2)
+                view["question"], view["choices"] = None, None
                 return bool(flags["yes"])
             return (await asyncio.to_thread(input, f"{q} Type 'yes' to continue: ")).strip().lower() == "yes"
 
@@ -423,11 +425,13 @@ async def main_async(args):
                     return view["text"]
                 return "I understand: pick up the <object>, stop, pause, resume, yes / no, what do you see."
 
-            ui = UIServer(on_text, lambda: {"mode": "LIVE ARM" if real else "DRY RUN", "state": view["state"], "target": eye.label,
+            ui = UIServer(on_text, lambda: {"mode": "LIVE ARM" if real else "DRY RUN", "state": view["state"], "target": eye.label, "question": view.get("question"), "choices": view.get("choices"),
                                             "distance": None if view["dist"] is None else f"{view['dist']:.0f} cm"}, args.port).start()
             print("UI:", ui.url, flush=True)
             if not args.no_browser:
                 webbrowser.open(ui.url)
+            view["question"] = "What should I pick up?"
+            view["choices"] = [{"label": "Cup", "send": "pick up the cup"}, {"label": "Bottle", "send": "pick up the bottle"}]
             while not flags["go"] and not flags["stop"]:            # watch the scene until told to go
                 try:
                     await eye.look()
@@ -436,6 +440,7 @@ async def main_async(args):
                 seen_ = f"{len(eye.cands)} {eye.label}(s) in view" if eye.cands else f"no {eye.label} in view"
                 show("waiting", seen_ + " - say 'pick up the " + eye.label + "'")
                 await asyncio.sleep(0.15)
+            view["question"], view["choices"] = None, None
             check_stop()
 
         async def gripper_pose():
