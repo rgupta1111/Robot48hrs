@@ -502,10 +502,10 @@ async def main_async(args):
             gp = await gripper_pose()
             say(f"joint {jn} rotated {sign * total:+.0f} deg; gripper axis ({gp.o_x:+.2f}, {gp.o_y:+.2f}, {gp.o_z:+.2f})", flush=True)
 
-        async def survey():
+        async def _survey_inner():
             """Nothing in view at the start and no remembered position: look around. Sweep the base in --survey-step-deg steps out to
             +/- --survey-deg, looking after each move; stop at the first object seen (nearest by depth in that view)."""
-            say("no bottle in view: looking around ...", flush=True)
+            say(f"no {eye.label} in view: looking around ...", flush=True)
             try:                                               # exploring is done with the gripper pointing straight down
                 await orient_down()
             except SystemExit as e:
@@ -530,6 +530,13 @@ async def main_async(args):
             await arm.move_to_joint_positions(JointPositions(values=j_here))
             return None
 
+        async def restore_wrist(j_start):
+            """Put the wrist joints (4, 5, 6) back where the run started (the horizontal / near-reset rotations), keeping the other joints."""
+            j = list((await arm.get_joint_positions()).values)
+            for k in (3, 4, 5):
+                j[k] = j_start[k]
+            await arm.move_to_joint_positions(JointPositions(values=j))
+
         async def orient_down():
             """Point the gripper straight DOWN (tool direction o_z -> -1) with ONE of the wrist joints (4 or 5, whichever points it further
             down; never 6), so the camera looks at the table below during the survey. The later flatten stage levels it for the grasp."""
@@ -538,7 +545,7 @@ async def main_async(args):
                 return
             j0 = list((await arm.get_joint_positions()).values)
             results = []
-            for jn in (4, 5):
+            for jn in (args.down_joint,):                     # joint 5 by default: the wrist pitch. Joint 4 rolls the gripper: left alone
                 for sg in (1, -1):
                     t = list(j0)
                     t[jn - 1] += sg * 10.0                        # 10-degree test move, then straight back
@@ -547,27 +554,50 @@ async def main_async(args):
                     await arm.move_to_joint_positions(JointPositions(values=j0))
                     results.append((abs(p1.o_z) - abs(p0.o_z), jn, sg))      # how much MORE vertical it got
                     say(f"  test: joint {jn} {sg * 10:+.0f} deg -> {abs(p1.o_z) - abs(p0.o_z):+.2f} more vertical")
-            good = [r for r in results if r[0] > 0.02]
+            good = [r for r in results if r[0] > 0.05]            # a real gain per 10 degrees, not noise
             if not good:
-                say("  neither joint 4 nor 5 points the gripper further down from here; sweeping as it is")
+                say(f"  joint {args.down_joint} does not point the gripper further down from here; sweeping as it is")
                 return
             _, jn, sg = max(good)
-            total = 0.0
+            total, last_oz = 0.0, p0.o_z
             while total < 100.0:
                 total += 10.0
                 t = list(j0)
                 t[jn - 1] += sg * total
                 await arm.move_to_joint_positions(JointPositions(values=t))
-                if (await gripper_pose()).o_z < -0.97:
+                oz = (await gripper_pose()).o_z
+                if oz < -0.97:
                     break
+                if last_oz - oz < 0.01:                       # it has stopped getting more vertical
+                    break
+                last_oz = oz
             gp = await gripper_pose()
             say(f"gripper pointed down with joint {jn} ({sg * total:+.0f} deg): axis ({gp.o_x:+.2f}, {gp.o_y:+.2f}, {gp.o_z:+.2f})")
+
+        async def survey():
+            """Look-around fallback (vertical gripper, wrist scan, joint sweep); once something is found the wrist goes back to the
+            rotations the run started with (the horizontal / near-reset ones) before the approach."""
+            j_start = list((await arm.get_joint_positions()).values)
+            t = await _survey_inner()
+            if not t:
+                return None
+            await restore_wrist(j_start)
+            eye.lock.unlock()
+            eye.widths, eye.heights = [], []
+            for _ in range(3):
+                t2, _ = await next_target(None, 0)
+                if t2:
+                    return t2
+                await asyncio.sleep(0.2)
+            say("  cannot see it from the restored pose: continuing with the position seen during the look-around", flush=True)
+            return t
 
         async def sweep_survey():
             """ALWAYS run first in a real run: world positions change between runs, so nothing remembered is trusted. Sweep the base from the
             starting pose in --survey-step-deg steps out to +/- --survey-deg, record the nearest object at each stop, then go back to the
             stop where the nearest one was seen and lock on it. The memory is reset to that object."""
             say("initial sweep: looking around from the starting pose (object positions change, so always sweep first) ...", flush=True)
+            j_start = list((await arm.get_joint_positions()).values)   # the starting (horizontal / near-reset) rotations
             await orient_down()                                   # the sweep is done with the gripper pointing straight down
             j_here = list((await arm.get_joint_positions()).values)
             offsets = [0.0] + [a * sg for a in np.arange(args.survey_step_deg, args.survey_deg + 1e-6, args.survey_step_deg) for sg in (1.0, -1.0)]
@@ -592,27 +622,29 @@ async def main_async(args):
                     reach = float(np.hypot(*best["world"][:2]))
                     say(f"  joint {args.survey_joint} {d:+.0f} deg: {args.object} {best['depth_mm'] / 10:.0f} cm from the camera (~{reach:.0f} mm from the base)", flush=True)
                     if reach <= 1000:
-                        seen.append((best["depth_mm"], d))
+                        seen.append((best["depth_mm"], d, best))
             if not seen:
-                await arm.move_to_joint_positions(JointPositions(values=j_here))
+                await restore_wrist(j_start)
+                await arm.move_to_joint_positions(JointPositions(values=j_here[:3] + j_start[3:]))
                 say("  the sweep saw nothing within reach", flush=True)
                 return None
-            _, d = min(seen)
-            say(f"  nearest: seen at joint {args.survey_joint} {d:+.0f} deg; going back there", flush=True)
-            j = list(j_here)
-            j[args.survey_joint - 1] += d
+            _, d, chosen = min(seen, key=lambda x: x[0])
+            say(f"  nearest: seen at joint {args.survey_joint} {d:+.0f} deg; going back there and returning the wrist to its starting rotations", flush=True)
+            j = list(j_start)                                     # wrist (4, 5, 6) and everything else as at the start ...
+            j[args.survey_joint - 1] = j_here[args.survey_joint - 1] + d     # ... except the sweep joint, at the stop where it was seen
             await arm.move_to_joint_positions(JointPositions(values=j))
             eye.lock.unlock()
-            eye.expected = None
             eye.widths, eye.heights = [], []                      # start fresh on the chosen object (the sweep mixed several)
-            memory.world = memory.first_world = memory.width = memory.height = None
-            memory.weight, memory.sightings = 0.0, 0
+            memory.world, memory.first_world = chosen["world"].copy(), chosen["world"].copy()   # its position as seen from the vertical view
+            memory.width, memory.height, memory.weight, memory.sightings = None, None, 1e-6, 0
+            eye.expected = chosen["world"]
             for _ in range(3):
                 t, _ = await next_target(None, 0)
                 if t:
                     return t
                 await asyncio.sleep(0.2)
-            return None
+            say("  cannot see it from the restored pose: continuing with the position seen during the sweep", flush=True)
+            return chosen
 
         async def find_again(known):
             """INITIAL search only (at the start of the run): search; if the first pass finds nothing, go back to the ORIGINAL pose, detect
@@ -814,6 +846,8 @@ def main():
                     "yes/no in the chat answer the confirmations")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-browser", action="store_true", help="with --ui: do not open the page automatically")
+    ap.add_argument("--down-joint", type=int, default=5, help="joint that points the gripper down for the sweep (5 = wrist pitch; 4 rolls the "
+                    "gripper, so it is left alone)")
     ap.add_argument("--survey-joint", type=int, default=2, help="joint rotated for the INITIAL sweep, Viam app numbering (2 = shoulder: "
                     "sweeps the camera near/far over the table; 1 = base: left/right)")
     ap.add_argument("--survey-deg", type=float, default=20.0, help="initial look-around: sweep that joint out to +/- this many degrees")
