@@ -1,0 +1,330 @@
+{
+  "run_id": "20261030T143145-dc4e36",
+  "started_at": 1793395905.5238566,
+  "object": "cup",
+  "mode": "live",
+  "machine": "sfhack16-main",
+  "params": {
+    "viam_address": "sfhack16-main.ty1cywh7tq.local.viam.cloud:8080",
+    "object": "cup",
+    "camera": "cam",
+    "arm": "arm",
+    "gripper": "gripper",
+    "sink": "viam",
+    "memory_file": "/home/adi274903/Documents/robohack/Robot48hrs/src/../data/object_memory.json",
+    "use_memory": false,
+    "ui": true,
+    "port": 8765,
+    "no_browser": false,
+    "sweep_pose": "/home/adi274903/Documents/robohack/Robot48hrs/src/../data/sweep_pose.json",
+    "down_joint": 5,
+    "no_sweep": true,
+    "handover_speed_dps": 15.0,
+    "arm_speed_dps": 50.0,
+    "handover_wait_s": 60.0,
+    "pull_hold_s": 0.3,
+    "handover_settle_s": 0.8,
+    "no_mongo": false,
+    "mongo_db": "robot48",
+    "mongo_coll": "pick_runs",
+    "no_handover": false,
+    "handover_xyz": "500,0,350",
+    "handover_gap_mm": 450.0,
+    "handover_max_reach_mm": 650.0,
+    "handover_z_mm": 350.0,
+    "pull_load": 1.0,
+    "survey_joint": 2,
+    "survey_deg": 20.0,
+    "survey_step_deg": 10.0,
+    "voxel": true,
+    "voxel_stride": 8,
+    "table_top_mm": -23.0,
+    "near_world": null,
+    "looks": 8,
+    "standoff_mm": 250.0,
+    "approach": "horizontal",
+    "line_tol_mm": 30.0,
+    "align_tol_mm": 30.0,
+    "clearance_mm": 120.0,
+    "lat_step_mm": 25.0,
+    "blind_lat_mm": 400.0,
+    "tip_ahead_mm": 35.0,
+    "hold_mm": null,
+    "grasp_tol_mm": 8.0,
+    "step_mm": 100.0,
+    "tol_mm": 30.0,
+    "lat_tol_mm": 25.0,
+    "jump_mm": 150.0,
+    "person_mm": 500.0,
+    "min_z_mm": 75.0,
+    "max_reach_mm": 800.0,
+    "max_cycles": 60,
+    "aim_height_frac": 0.5,
+    "grip_width_mm": 70.0,
+    "grip_trim_mm": -1.5,
+    "wrist_joint": 0,
+    "roll_joint": 6,
+    "roll_target_deg": 0.0,
+    "roll_tol_deg": 10.0,
+    "wrist_deg": 100.0,
+    "peek_down_mm": 20.0,
+    "max_j6_deg": 0.0,
+    "wrist_sign": 0,
+    "lift_mm": 120.0,
+    "yes": false,
+    "retries": 2,
+    "grasp_check": true,
+    "open_pos": 840.0,
+    "max_sight_mm": 1000.0,
+    "confirm_sightings": 2,
+    "attempt": 0
+  },
+  "stages": [
+    {
+      "stage": "waiting",
+      "start_s": 1.56,
+      "note": "3 cup(s) in view - say 'pick up the cup'",
+      "end_s": 77.49
+    },
+    {
+      "stage": "tracking",
+      "start_s": 77.49,
+      "note": "cup: 68 cm, ~90 mm wide",
+      "end_s": 108.42
+    },
+    {
+      "stage": "approaching",
+      "start_s": 108.42,
+      "note": "approaching the pre-grasp pose",
+      "end_s": 112.54
+    },
+    {
+      "stage": "searching",
+      "start_s": 112.54,
+      "note": "no cup in view",
+      "end_s": 113.84
+    },
+    {
+      "stage": "tracking",
+      "start_s": 113.84,
+      "note": "cup: 63 cm, ~84 mm wide",
+      "end_s": 123.97
+    },
+    {
+      "stage": "advancing",
+      "start_s": 123.97,
+      "note": "aligning and advancing onto the object",
+      "end_s": 127.49
+    },
+    {
+      "stage": "tracking",
+      "start_s": 127.49,
+      "note": "cup: 28 cm, ~81 mm wide",
+      "end_s": 138.34
+    },
+    {
+      "stage": "searching",
+      "start_s": 138.34,
+      "note": "no cup in view",
+      "end_s": 138.98
+    },
+    {
+      "stage": "tracking",
+      "start_s": 138.98,
+      "note": "cup: 24 cm, ~109 mm wide",
+      "end_s": 155.04
+    }
+  ],
+  "events": [
+    {
+      "t": 77.64,
+      "msg": "[look 1] cup at world x895 y-38 z44 mm, 68 cm from the camera, ~90 wide x 130 tall mm; 66 cm from the gripper; next waypoint [        448          14         369]"
+    },
+    {
+      "t": 78.72,
+      "msg": "[look 2] cup at world x895 y-38 z44 mm, 68 cm from the camera, ~90 wide x 130 tall mm; 66 cm from the gripper; next waypoint [        448          14         369]"
+    },
+    {
+      "t": 79.65,
+      "msg": "[look 3] cup at world x893 y-38 z45 mm, 68 cm from the camera, ~90 wide x 130 tall mm; 65 cm from the gripper; next waypoint [        448          14         370]"
+    },
+    {
+      "t": 80.64,
+      "msg": "[look 4] cup at world x891 y-38 z47 mm, 68 cm from the camera, ~90 wide x 130 tall mm; 65 cm from the gripper; next waypoint [        448          14         370]"
+    },
+    {
+      "t": 81.88,
+      "msg": "[look 5] cup at world x896 y-38 z43 mm, 68 cm from the camera, ~90 wide x 131 tall mm; 66 cm from the gripper; next waypoint [        448          14         369]"
+    },
+    {
+      "t": 82.38,
+      "msg": "voxel map: 938 occupied voxels; object box near it: centre x875 y-50 z75, size 130 x 130 x 130 mm"
+    },
+    {
+      "t": 82.38,
+      "msg": "the object is 897 mm from the base axis (arm reach ~850 mm); width estimate 90.45138597219865 mm"
+    },
+    {
+      "t": 82.38,
+      "msg": "warning: the world estimate (897 mm) is past 800 mm, but it shifts ~10 cm with the viewpoint; the approach is measured in the gripper frame and the motion planner refuses anything truly unreachable"
+    },
+    {
+      "t": 82.54,
+      "msg": "FLATTEN: rotate joint 4 or 5 only (whichever levels the gripper; never 6), in 10-degree steps up to 100. Reply 'yes' to continue or 'no' to cancel."
+    },
+    {
+      "t": 86.98,
+      "msg": "  test: joint 4 +10 deg -> levels by +0.02, pointing more forward"
+    },
+    {
+      "t": 88.34,
+      "msg": "  test: joint 4 -10 deg -> levels by -0.02"
+    },
+    {
+      "t": 89.26,
+      "msg": "  test: joint 5 +10 deg -> levels by +0.03"
+    },
+    {
+      "t": 90.28,
+      "msg": "  test: joint 5 -10 deg -> levels by -0.02"
+    },
+    {
+      "t": 96.23,
+      "msg": "joint 4 rotated +80 deg; gripper axis (+0.87, +0.00, -0.49)"
+    },
+    {
+      "t": 96.53,
+      "msg": "setting joint 6 (the gripper roll) from -272 to 0 deg for the pick"
+    },
+    {
+      "t": 108.42,
+      "msg": "joint 6 is now -0 deg"
+    },
+    {
+      "t": 113.44,
+      "msg": "[A 1] 511 mm ahead, 35 mm sideways, -375 mm in height (last known: out of view)"
+    },
+    {
+      "t": 115.01,
+      "msg": "[A 2] 499 mm ahead, 19 mm sideways, -276 mm in height"
+    },
+    {
+      "t": 116.38,
+      "msg": "[A 3] 492 mm ahead, 14 mm sideways, -176 mm in height"
+    },
+    {
+      "t": 117.53,
+      "msg": "[A 4] 473 mm ahead, 5 mm sideways, -77 mm in height"
+    },
+    {
+      "t": 118.87,
+      "msg": "[A 5] 427 mm ahead, 5 mm sideways, -0 mm in height"
+    },
+    {
+      "t": 121.35,
+      "msg": "[A 6] 397 mm ahead, 8 mm sideways, -0 mm in height"
+    },
+    {
+      "t": 122.48,
+      "msg": "[A 7] 293 mm ahead, 10 mm sideways, -0 mm in height"
+    },
+    {
+      "t": 123.86,
+      "msg": "level with the object and lined up at the pre-grasp distance"
+    },
+    {
+      "t": 123.97,
+      "msg": "joint 6 changed -5.4 deg during the approach"
+    },
+    {
+      "t": 123.97,
+      "msg": "ADVANCE along the gripper axis onto the object (re-planned every step), then CLOSE and lift. Reply 'yes' to continue or 'no' to cancel."
+    },
+    {
+      "t": 128.11,
+      "msg": "[C 1] aligning: 114 mm off-axis, 233 mm ahead"
+    },
+    {
+      "t": 128.56,
+      "msg": "[C 2] aligning: 103 mm off-axis, 225 mm ahead"
+    },
+    {
+      "t": 129.05,
+      "msg": "[C 3] aligning: 91 mm off-axis, 225 mm ahead"
+    },
+    {
+      "t": 129.5,
+      "msg": "[C 4] aligning: 74 mm off-axis, 226 mm ahead"
+    },
+    {
+      "t": 130.01,
+      "msg": "[C 5] aligning: 49 mm off-axis, 288 mm ahead"
+    },
+    {
+      "t": 131.44,
+      "msg": "  that step is not reachable / blocked: skipping it ((<Status.UNKNOWN: 2>, 'all IK solutions failed constraints. Failures: { obstacle constraint: violation between cup and gripper:claws geometries: 100.00% }, ', N)"
+    },
+    {
+      "t": 131.44,
+      "msg": "[C 6] 295 mm along the axis, 27 mm off to the side"
+    },
+    {
+      "t": 134.04,
+      "msg": "  that step is not reachable / blocked: skipping it ((<Status.UNKNOWN: 2>, 'all IK solutions failed constraints. Failures: { obstacle constraint: violation between cup and gripper:claws geometries: 100.00% }, ', N)"
+    },
+    {
+      "t": 134.04,
+      "msg": "[C 7] 294 mm along the axis, 13 mm off to the side"
+    },
+    {
+      "t": 135.68,
+      "msg": "[C 8] 294 mm along the axis, 5 mm off to the side"
+    },
+    {
+      "t": 137.8,
+      "msg": "  that step is not reachable / blocked: skipping it ((<Status.UNKNOWN: 2>, 'all IK solutions failed constraints. Failures: { obstacle constraint: violation between cup and gripper:case-gripper geometries: 100.00% )"
+    },
+    {
+      "t": 137.8,
+      "msg": "[C 9] 198 mm along the axis, 19 mm off to the side"
+    },
+    {
+      "t": 138.5,
+      "msg": "[C 10] object out of view: lowered 10 mm (10/20) to look for it again"
+    },
+    {
+      "t": 140.04,
+      "msg": "  that step is not reachable / blocked: skipping it ((<Status.UNKNOWN: 2>, 'all IK solutions failed constraints. Failures: { obstacle constraint: violation between cup and gripper:case-gripper geometries: 100.00% )"
+    },
+    {
+      "t": 140.04,
+      "msg": "[C 11] 203 mm along the axis, 11 mm off to the side"
+    },
+    {
+      "t": 141.52,
+      "msg": "  that step is not reachable / blocked: skipping it ((<Status.UNKNOWN: 2>, 'all IK solutions failed constraints. Failures: { obstacle constraint: violation between cup and gripper:case-gripper geometries: 100.00% )"
+    },
+    {
+      "t": 141.52,
+      "msg": "[C 12] 202 mm along the axis, 9 mm off to the side"
+    },
+    {
+      "t": 141.52,
+      "msg": "I cannot move any closer from here by myself. If the gripper is at the cup, say 'grip' to close now, or 'stop'."
+    }
+  ],
+  "metrics": {
+    "width_mm": 85.61308858485306,
+    "object_world_mm": [
+      894.6,
+      -34.9,
+      44.2
+    ]
+  },
+  "ended_at": 1793396060.5676887,
+  "duration_s": 155.04,
+  "stage_reached": "tracking",
+  "success": false,
+  "failure_reason": "stopped from the page",
+  "failure_class": "operator_stop"
+}

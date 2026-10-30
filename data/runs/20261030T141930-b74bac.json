@@ -1,0 +1,378 @@
+{
+  "run_id": "20261030T141930-b74bac",
+  "started_at": 1793395170.2214112,
+  "object": "cup",
+  "mode": "live",
+  "machine": "sfhack16-main",
+  "params": {
+    "viam_address": "sfhack16-main.ty1cywh7tq.local.viam.cloud:8080",
+    "object": "cup",
+    "camera": "cam",
+    "arm": "arm",
+    "gripper": "gripper",
+    "sink": "viam",
+    "memory_file": "/home/adi274903/Documents/robohack/Robot48hrs/src/../data/object_memory.json",
+    "use_memory": false,
+    "ui": true,
+    "port": 8765,
+    "no_browser": false,
+    "sweep_pose": "/home/adi274903/Documents/robohack/Robot48hrs/src/../data/sweep_pose.json",
+    "down_joint": 5,
+    "no_sweep": true,
+    "handover_speed_dps": 15.0,
+    "arm_speed_dps": 50.0,
+    "handover_wait_s": 60.0,
+    "pull_hold_s": 0.3,
+    "handover_settle_s": 0.8,
+    "no_mongo": false,
+    "mongo_db": "robot48",
+    "mongo_coll": "pick_runs",
+    "no_handover": false,
+    "handover_xyz": "500,0,350",
+    "handover_gap_mm": 450.0,
+    "handover_max_reach_mm": 650.0,
+    "handover_z_mm": 350.0,
+    "pull_load": 1.0,
+    "survey_joint": 2,
+    "survey_deg": 20.0,
+    "survey_step_deg": 10.0,
+    "voxel": true,
+    "voxel_stride": 8,
+    "table_top_mm": -23.0,
+    "near_world": null,
+    "looks": 8,
+    "standoff_mm": 250.0,
+    "approach": "horizontal",
+    "line_tol_mm": 30.0,
+    "align_tol_mm": 30.0,
+    "clearance_mm": 120.0,
+    "lat_step_mm": 25.0,
+    "blind_lat_mm": 400.0,
+    "tip_ahead_mm": 35.0,
+    "hold_mm": null,
+    "grasp_tol_mm": 8.0,
+    "step_mm": 100.0,
+    "tol_mm": 30.0,
+    "lat_tol_mm": 25.0,
+    "jump_mm": 150.0,
+    "person_mm": 500.0,
+    "min_z_mm": 75.0,
+    "max_reach_mm": 800.0,
+    "max_cycles": 60,
+    "aim_height_frac": 0.5,
+    "grip_width_mm": 70.0,
+    "grip_trim_mm": -1.5,
+    "wrist_joint": 0,
+    "roll_joint": 6,
+    "roll_target_deg": 0.0,
+    "roll_tol_deg": 10.0,
+    "wrist_deg": 100.0,
+    "peek_down_mm": 20.0,
+    "max_j6_deg": 0.0,
+    "wrist_sign": 0,
+    "lift_mm": 120.0,
+    "yes": false
+  },
+  "stages": [
+    {
+      "stage": "waiting",
+      "start_s": 1.71,
+      "note": "1 cup(s) in view - say 'pick up the cup'",
+      "end_s": 10.41
+    },
+    {
+      "stage": "tracking",
+      "start_s": 10.41,
+      "note": "cup: 79 cm, ~94 mm wide",
+      "end_s": 41.15
+    },
+    {
+      "stage": "approaching",
+      "start_s": 41.15,
+      "note": "approaching the pre-grasp pose",
+      "end_s": 41.57
+    },
+    {
+      "stage": "searching",
+      "start_s": 41.57,
+      "note": "no cup in view",
+      "end_s": 42.69
+    },
+    {
+      "stage": "tracking",
+      "start_s": 42.69,
+      "note": "cup: 92 cm, ~115 mm wide",
+      "end_s": 52.42
+    },
+    {
+      "stage": "advancing",
+      "start_s": 52.42,
+      "note": "aligning and advancing onto the object",
+      "end_s": 58.47
+    },
+    {
+      "stage": "tracking",
+      "start_s": 58.47,
+      "note": "cup: 29 cm, ~83 mm wide",
+      "end_s": 63.74
+    },
+    {
+      "stage": "paused",
+      "start_s": 63.74,
+      "note": "a person is close: waiting",
+      "end_s": 103.12
+    }
+  ],
+  "events": [
+    {
+      "t": 10.43,
+      "msg": "[look 1] cup at world x968 y134 z25 mm, 79 cm from the camera, ~94 wide x 128 tall mm; 77 cm from the gripper; next waypoint [        477          38         466]"
+    },
+    {
+      "t": 11.73,
+      "msg": "[look 2] cup at world x971 y134 z22 mm, 79 cm from the camera, ~94 wide x 129 tall mm; 77 cm from the gripper; next waypoint [        477          38         466]"
+    },
+    {
+      "t": 12.44,
+      "msg": "[look 3] cup at world x969 y134 z24 mm, 79 cm from the camera, ~94 wide x 129 tall mm; 77 cm from the gripper; next waypoint [        477          38         466]"
+    },
+    {
+      "t": 13.58,
+      "msg": "[look 4] cup at world x966 y133 z27 mm, 79 cm from the camera, ~93 wide x 128 tall mm; 76 cm from the gripper; next waypoint [        477          38         466]"
+    },
+    {
+      "t": 15.18,
+      "msg": "[look 5] cup at world x968 y134 z25 mm, 79 cm from the camera, ~93 wide x 129 tall mm; 77 cm from the gripper; next waypoint [        477          38         466]"
+    },
+    {
+      "t": 15.68,
+      "msg": "voxel map: 643 occupied voxels; object box near it: centre x938 y125 z62, size 155 x 130 x 105 mm"
+    },
+    {
+      "t": 15.68,
+      "msg": "the object is 977 mm from the base axis (arm reach ~850 mm); width estimate 93.50473969424162 mm"
+    },
+    {
+      "t": 15.68,
+      "msg": "warning: the world estimate (977 mm) is past 800 mm, but it shifts ~10 cm with the viewpoint; the approach is measured in the gripper frame and the motion planner refuses anything truly unreachable"
+    },
+    {
+      "t": 15.8,
+      "msg": "FLATTEN: rotate joint 4 or 5 only (whichever levels the gripper; never 6), in 10-degree steps up to 100. Reply 'yes' to continue or 'no' to cancel."
+    },
+    {
+      "t": 21.07,
+      "msg": "  test: joint 4 +10 deg -> levels by +0.02, pointing more forward"
+    },
+    {
+      "t": 21.97,
+      "msg": "  test: joint 4 -10 deg -> levels by -0.02"
+    },
+    {
+      "t": 22.87,
+      "msg": "  test: joint 5 +10 deg -> levels by +0.03"
+    },
+    {
+      "t": 23.76,
+      "msg": "  test: joint 5 -10 deg -> levels by -0.02, pointing more forward"
+    },
+    {
+      "t": 29.22,
+      "msg": "joint 4 rotated +80 deg; gripper axis (+0.94, +0.00, -0.33)"
+    },
+    {
+      "t": 29.23,
+      "msg": "setting joint 6 (the gripper roll) from -272 to 0 deg for the pick"
+    },
+    {
+      "t": 41.15,
+      "msg": "joint 6 is now -0 deg"
+    },
+    {
+      "t": 42.44,
+      "msg": "[A 1] 551 mm ahead, 137 mm sideways, -482 mm in height (last known: out of view)"
+    },
+    {
+      "t": 43.57,
+      "msg": "[A 2] 749 mm ahead, 33 mm sideways, -386 mm in height"
+    },
+    {
+      "t": 44.75,
+      "msg": "  the object moved 188 mm: re-targeting"
+    },
+    {
+      "t": 45.81,
+      "msg": "[A 3] 573 mm ahead, 58 mm sideways, -286 mm in height"
+    },
+    {
+      "t": 47.55,
+      "msg": "[A 4] 527 mm ahead, 64 mm sideways, -189 mm in height"
+    },
+    {
+      "t": 48.76,
+      "msg": "[A 5] 495 mm ahead, 54 mm sideways, -94 mm in height"
+    },
+    {
+      "t": 49.65,
+      "msg": "[A 6] 436 mm ahead, 29 mm sideways, -8 mm in height"
+    },
+    {
+      "t": 50.77,
+      "msg": "[A 7] 431 mm ahead, 15 mm sideways, -8 mm in height"
+    },
+    {
+      "t": 52.0,
+      "msg": "[A 8] 323 mm ahead, 7 mm sideways, -7 mm in height"
+    },
+    {
+      "t": 52.42,
+      "msg": "level with the object and lined up at the pre-grasp distance"
+    },
+    {
+      "t": 52.42,
+      "msg": "joint 6 changed -6.9 deg during the approach"
+    },
+    {
+      "t": 52.43,
+      "msg": "ADVANCE along the gripper axis onto the object (re-planned every step), then CLOSE and lift. Reply 'yes' to continue or 'no' to cancel."
+    },
+    {
+      "t": 58.86,
+      "msg": "[C 1] aligning: 66 mm off-axis, 247 mm ahead"
+    },
+    {
+      "t": 59.63,
+      "msg": "[C 2] aligning: 55 mm off-axis, 243 mm ahead"
+    },
+    {
+      "t": 61.61,
+      "msg": "[C 3] aligning: 39 mm off-axis, 245 mm ahead"
+    },
+    {
+      "t": 63.5,
+      "msg": "[C 4] 308 mm along the axis, 14 mm off to the side"
+    },
+    {
+      "t": 63.75,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 65.19,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 66.48,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 68.01,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 69.27,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 70.54,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 71.9,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 73.26,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 74.85,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 76.15,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 78.04,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 79.19,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 81.16,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 83.36,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 85.05,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 86.56,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 88.07,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 89.36,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 90.96,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 92.19,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 93.38,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 94.68,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 96.0,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 97.31,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 98.53,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 100.87,
+      "msg": "a person is close to the camera/gripper: waiting"
+    },
+    {
+      "t": 102.12,
+      "msg": "a person is close to the camera/gripper: waiting"
+    }
+  ],
+  "metrics": {
+    "width_mm": 109.5137196948524,
+    "object_world_mm": [
+      1170.7,
+      296.8,
+      -21.1
+    ]
+  },
+  "ended_at": 1793395273.345829,
+  "duration_s": 103.12,
+  "stage_reached": "paused",
+  "success": false,
+  "failure_reason": "stopped from the page",
+  "failure_class": "operator_stop"
+}

@@ -1,0 +1,488 @@
+{
+  "run_id": "20261030T150327-5214b6",
+  "started_at": 1793397807.9339395,
+  "object": "bottle",
+  "mode": "live",
+  "machine": "sfhack16-main",
+  "params": {
+    "viam_address": "sfhack16-main.ty1cywh7tq.local.viam.cloud:8080",
+    "object": "cup",
+    "camera": "cam",
+    "arm": "arm",
+    "gripper": "gripper",
+    "sink": "viam",
+    "memory_file": "/home/adi274903/Documents/robohack/Robot48hrs/src/../data/object_memory.json",
+    "use_memory": false,
+    "ui": true,
+    "port": 8765,
+    "no_browser": false,
+    "sweep_pose": "/home/adi274903/Documents/robohack/Robot48hrs/src/../data/sweep_pose.json",
+    "down_joint": 5,
+    "no_sweep": true,
+    "handover_speed_dps": 15.0,
+    "arm_speed_dps": 50.0,
+    "handover_wait_s": 60.0,
+    "pull_hold_s": 0.3,
+    "handover_settle_s": 0.8,
+    "no_mongo": false,
+    "mongo_db": "robot48",
+    "mongo_coll": "pick_runs",
+    "no_handover": false,
+    "handover_xyz": "500,0,350",
+    "handover_gap_mm": 450.0,
+    "handover_max_reach_mm": 650.0,
+    "handover_z_mm": 350.0,
+    "pull_load": 1.0,
+    "survey_joint": 2,
+    "survey_deg": 20.0,
+    "survey_step_deg": 10.0,
+    "voxel": true,
+    "voxel_stride": 8,
+    "table_top_mm": -23.0,
+    "near_world": null,
+    "looks": 8,
+    "standoff_mm": 250.0,
+    "approach": "horizontal",
+    "line_tol_mm": 30.0,
+    "align_tol_mm": 30.0,
+    "clearance_mm": 120.0,
+    "lat_step_mm": 25.0,
+    "blind_lat_mm": 400.0,
+    "tip_ahead_mm": 35.0,
+    "hold_mm": null,
+    "grasp_tol_mm": 8.0,
+    "step_mm": 100.0,
+    "tol_mm": 30.0,
+    "lat_tol_mm": 25.0,
+    "jump_mm": 150.0,
+    "person_mm": 500.0,
+    "min_z_mm": 75.0,
+    "max_reach_mm": 800.0,
+    "max_cycles": 60,
+    "aim_height_frac": 0.5,
+    "grip_width_mm": null,
+    "grip_trim_mm": -1.5,
+    "wrist_joint": 0,
+    "roll_joint": 6,
+    "roll_target_deg": 0.0,
+    "roll_tol_deg": 10.0,
+    "wrist_deg": 100.0,
+    "peek_down_mm": 20.0,
+    "max_j6_deg": 0.0,
+    "wrist_sign": 0,
+    "lift_mm": 120.0,
+    "yes": true,
+    "free_within_mm": 350.0,
+    "aim_trim_mm": "0,-50,0",
+    "recentre_tol_mm": 6.0,
+    "recentre_tries": 4,
+    "centre_tol_mm": 10.0,
+    "centre_at_mm": 280.0,
+    "person_conf": 0.55,
+    "person_min_px": 160.0,
+    "scan_person": true,
+    "scan_deg": 90.0,
+    "scan_step_deg": 30.0,
+    "scan_radius_mm": 500.0,
+    "ask_handover": true,
+    "box_obstacle": true,
+    "grip_map": "cup=70,bottle=45",
+    "retries": 0,
+    "grasp_check": true,
+    "open_pos": 840.0,
+    "max_sight_mm": 1000.0,
+    "confirm_sightings": 2,
+    "attempt": 0
+  },
+  "stages": [
+    {
+      "stage": "waiting",
+      "start_s": 1.63,
+      "note": "2 cup(s) in view - say 'pick up the cup'",
+      "end_s": 9.03
+    },
+    {
+      "stage": "searching",
+      "start_s": 9.03,
+      "note": "no bottle in view",
+      "end_s": 9.84
+    },
+    {
+      "stage": "tracking",
+      "start_s": 9.84,
+      "note": "bottle: 60 cm, ~66 mm wide",
+      "end_s": 31.01
+    },
+    {
+      "stage": "approaching",
+      "start_s": 31.01,
+      "note": "approaching the pre-grasp pose",
+      "end_s": 32.5
+    },
+    {
+      "stage": "searching",
+      "start_s": 32.5,
+      "note": "no bottle in view",
+      "end_s": 35.89
+    },
+    {
+      "stage": "tracking",
+      "start_s": 35.89,
+      "note": "bottle: 59 cm, ~70 mm wide",
+      "end_s": 43.83
+    },
+    {
+      "stage": "advancing",
+      "start_s": 43.83,
+      "note": "aligning and advancing onto the object",
+      "end_s": 44.44
+    },
+    {
+      "stage": "tracking",
+      "start_s": 44.44,
+      "note": "bottle: 30 cm, ~71 mm wide",
+      "end_s": 54.94
+    },
+    {
+      "stage": "searching",
+      "start_s": 54.94,
+      "note": "no bottle in view",
+      "end_s": 56.0
+    },
+    {
+      "stage": "tracking",
+      "start_s": 56.0,
+      "note": "bottle: 19 cm, ~50 mm wide",
+      "end_s": 56.51
+    },
+    {
+      "stage": "searching",
+      "start_s": 56.51,
+      "note": "no bottle in view",
+      "end_s": 57.35
+    },
+    {
+      "stage": "tracking",
+      "start_s": 57.35,
+      "note": "bottle: 19 cm, ~52 mm wide",
+      "end_s": 59.15
+    },
+    {
+      "stage": "searching",
+      "start_s": 59.15,
+      "note": "no bottle in view",
+      "end_s": 59.95
+    },
+    {
+      "stage": "tracking",
+      "start_s": 59.95,
+      "note": "bottle: 20 cm, ~64 mm wide",
+      "end_s": 69.06
+    },
+    {
+      "stage": "searching",
+      "start_s": 69.06,
+      "note": "no bottle in view",
+      "end_s": 80.38
+    },
+    {
+      "stage": "lifted",
+      "start_s": 80.38,
+      "note": "lifted",
+      "end_s": 97.49
+    },
+    {
+      "stage": "handover",
+      "start_s": 97.49,
+      "note": "holding it out: take it, or say 'release'",
+      "end_s": 104.15
+    },
+    {
+      "stage": "done",
+      "start_s": 104.15,
+      "note": "handed over",
+      "end_s": 106.15
+    }
+  ],
+  "events": [
+    {
+      "t": 9.05,
+      "msg": "[look 1] no cup seen"
+    },
+    {
+      "t": 9.85,
+      "msg": "[look 2] cup at world x817 y16 z151 mm, 60 cm from the camera, ~66 wide x 57 tall mm; 56 cm from the gripper; next waypoint [        477          22         464]"
+    },
+    {
+      "t": 10.7,
+      "msg": "[look 3] cup at world x817 y16 z151 mm, 60 cm from the camera, ~66 wide x 57 tall mm; 56 cm from the gripper; next waypoint [        477          22         464]"
+    },
+    {
+      "t": 11.44,
+      "msg": "[look 4] cup at world x817 y16 z151 mm, 60 cm from the camera, ~66 wide x 57 tall mm; 56 cm from the gripper; next waypoint [        477          22         464]"
+    },
+    {
+      "t": 12.48,
+      "msg": "[look 5] cup at world x816 y16 z152 mm, 60 cm from the camera, ~65 wide x 57 tall mm; 56 cm from the gripper; next waypoint [        477          22         464]"
+    },
+    {
+      "t": 12.98,
+      "msg": "voxel map: 602 occupied voxels; object box near it: centre x800 y25 z162, size 80 x 80 x 105 mm"
+    },
+    {
+      "t": 12.98,
+      "msg": "the object is 816 mm from the base axis (arm reach ~850 mm); width estimate 65.7369459746162 mm"
+    },
+    {
+      "t": 12.98,
+      "msg": "warning: the world estimate (816 mm) is past 800 mm, but it shifts ~10 cm with the viewpoint; the approach is measured in the gripper frame and the motion planner refuses anything truly unreachable"
+    },
+    {
+      "t": 14.01,
+      "msg": "  test: joint 4 +10 deg -> levels by +0.02, pointing more forward"
+    },
+    {
+      "t": 14.74,
+      "msg": "  test: joint 4 -10 deg -> levels by -0.02"
+    },
+    {
+      "t": 15.49,
+      "msg": "  test: joint 5 +10 deg -> levels by +0.03"
+    },
+    {
+      "t": 16.22,
+      "msg": "  test: joint 5 -10 deg -> levels by -0.02, pointing more forward"
+    },
+    {
+      "t": 21.46,
+      "msg": "joint 4 rotated +80 deg; gripper axis (+0.94, +0.00, -0.33)"
+    },
+    {
+      "t": 21.47,
+      "msg": "setting joint 6 (the gripper roll) from -272 to 0 deg for the pick"
+    },
+    {
+      "t": 31.01,
+      "msg": "joint 6 is now -0 deg"
+    },
+    {
+      "t": 33.1,
+      "msg": "[A 1] 399 mm ahead, 20 mm sideways, -404 mm in height (last known: out of view)"
+    },
+    {
+      "t": 34.35,
+      "msg": "[A 2] 399 mm ahead, 15 mm sideways, -304 mm in height (last known: out of view)"
+    },
+    {
+      "t": 34.73,
+      "msg": "lost the object: searching nearby ..."
+    },
+    {
+      "t": 35.89,
+      "msg": "  found it again after backing off 80 mm"
+    },
+    {
+      "t": 37.07,
+      "msg": "[A 3] 469 mm ahead, 62 mm sideways, -279 mm in height"
+    },
+    {
+      "t": 38.47,
+      "msg": "[A 4] 457 mm ahead, 53 mm sideways, -211 mm in height"
+    },
+    {
+      "t": 40.45,
+      "msg": "[A 5] 471 mm ahead, 39 mm sideways, -114 mm in height"
+    },
+    {
+      "t": 41.25,
+      "msg": "[A 6] 458 mm ahead, 20 mm sideways, -20 mm in height"
+    },
+    {
+      "t": 43.12,
+      "msg": "[A 7] 376 mm ahead, 13 mm sideways, -20 mm in height"
+    },
+    {
+      "t": 43.78,
+      "msg": "level with the object and lined up at the pre-grasp distance"
+    },
+    {
+      "t": 43.83,
+      "msg": "joint 6 changed -2.9 deg during the approach"
+    },
+    {
+      "t": 45.17,
+      "msg": "[C 1] aligning: 91 mm off-axis, 248 mm ahead"
+    },
+    {
+      "t": 46.89,
+      "msg": "[C 2] aligning: 80 mm off-axis, 245 mm ahead"
+    },
+    {
+      "t": 50.53,
+      "msg": "[C 3] aligning: 69 mm off-axis, 244 mm ahead"
+    },
+    {
+      "t": 51.61,
+      "msg": "[C 4] aligning: 54 mm off-axis, 242 mm ahead"
+    },
+    {
+      "t": 52.17,
+      "msg": "[C 5] aligning: 41 mm off-axis, 243 mm ahead"
+    },
+    {
+      "t": 52.79,
+      "msg": "[C 6] aligning: 27 mm off-axis, 244 mm ahead"
+    },
+    {
+      "t": 53.3,
+      "msg": "[C 7] aligning: 15 mm off-axis, 242 mm ahead"
+    },
+    {
+      "t": 54.14,
+      "msg": "[C 8] 242 mm along the axis, 6 mm off to the side"
+    },
+    {
+      "t": 54.66,
+      "msg": "[C 9] aligning: 21 mm off-axis, 155 mm ahead"
+    },
+    {
+      "t": 55.16,
+      "msg": "[C 10] object out of view: lowered 10 mm (10/20) to look for it again"
+    },
+    {
+      "t": 55.6,
+      "msg": "[C 11] object out of view: lowered 10 mm (20/20) to look for it again"
+    },
+    {
+      "t": 56.25,
+      "msg": "[C 12] aligning: 23 mm off-axis, 129 mm ahead"
+    },
+    {
+      "t": 56.88,
+      "msg": "[C 13] aligning: 66 mm off-axis, 141 mm ahead (out of view)"
+    },
+    {
+      "t": 57.59,
+      "msg": "[C 14] aligning: 24 mm off-axis, 127 mm ahead"
+    },
+    {
+      "t": 58.26,
+      "msg": "[C 15] aligning: 47 mm off-axis, 126 mm ahead"
+    },
+    {
+      "t": 59.0,
+      "msg": "[C 16] aligning: 44 mm off-axis, 125 mm ahead"
+    },
+    {
+      "t": 59.74,
+      "msg": "[C 17] aligning: 52 mm off-axis, 136 mm ahead (out of view)"
+    },
+    {
+      "t": 60.28,
+      "msg": "[C 18] aligning: 27 mm off-axis, 144 mm ahead"
+    },
+    {
+      "t": 61.4,
+      "msg": "[C 19] aligning: 29 mm off-axis, 131 mm ahead"
+    },
+    {
+      "t": 62.32,
+      "msg": "[C 20] aligning: 29 mm off-axis, 129 mm ahead"
+    },
+    {
+      "t": 63.47,
+      "msg": "[C 21] aligning: 27 mm off-axis, 128 mm ahead"
+    },
+    {
+      "t": 65.8,
+      "msg": "[C 22] aligning: 18 mm off-axis, 125 mm ahead"
+    },
+    {
+      "t": 66.72,
+      "msg": "[C 23] aligning: 32 mm off-axis, 128 mm ahead"
+    },
+    {
+      "t": 68.24,
+      "msg": "  planner: (<Status.UNKNOWN: 2>, 'all IK solutions failed constraints. Failures: { obstacle constraint: violation between bottle and gripper:case-gripper geometries: 100.00% }, ', None)"
+    },
+    {
+      "t": 68.24,
+      "msg": "  close to the cup: retrying this step without the cup as an obstacle"
+    },
+    {
+      "t": 68.8,
+      "msg": "[C 24] 130 mm along the axis, 4 mm off to the side"
+    },
+    {
+      "t": 69.67,
+      "msg": "[C 25] aligning: 50 mm off-axis, 34 mm ahead, backing off 86 mm (out of view)"
+    },
+    {
+      "t": 70.89,
+      "msg": "  planner: (<Status.UNKNOWN: 2>, 'all IK solutions failed constraints. Failures: { obstacle constraint: violation between bottle and gripper:case-gripper geometries: 100.00% }, ', None)"
+    },
+    {
+      "t": 70.89,
+      "msg": "  close to the cup: retrying this step without the cup as an obstacle"
+    },
+    {
+      "t": 71.46,
+      "msg": "[C 26] 120 mm along the axis, 25 mm off to the side (out of view)"
+    },
+    {
+      "t": 72.16,
+      "msg": "  recentre: cup not visible from here, closing on the last alignment"
+    },
+    {
+      "t": 77.76,
+      "msg": "gripper position: 450.0 (commanded 450; 840 = fully open)"
+    },
+    {
+      "t": 78.34,
+      "msg": "lifted."
+    },
+    {
+      "t": 80.38,
+      "msg": "  the cup is not on the table any more: taking it as picked up"
+    },
+    {
+      "t": 85.8,
+      "msg": "  scan base +0 deg: person found"
+    },
+    {
+      "t": 85.85,
+      "msg": "a person is at world x1599 y-190: I will hold it out at x645 y-77 z350"
+    },
+    {
+      "t": 85.85,
+      "msg": "HAND OVER: move the bottle to x645 y-77 z350 and hold it out for you to take. Reply 'yes' to continue or 'no' to cancel."
+    },
+    {
+      "t": 97.49,
+      "msg": "Holding the bottle out. Take it: I let go when I feel a steady pull, or reply 'release' / 'yes'."
+    },
+    {
+      "t": 100.03,
+      "msg": "felt a steady pull: letting go"
+    },
+    {
+      "t": 104.15,
+      "msg": "handed over."
+    }
+  ],
+  "metrics": {
+    "width_mm": 58.64749985649648,
+    "gripper_closed_pos": 450.0,
+    "object_world_mm": [
+      812.1,
+      24.3,
+      142.7
+    ]
+  },
+  "ended_at": 1793397914.0861962,
+  "duration_s": 106.15,
+  "stage_reached": "done",
+  "success": true,
+  "failure_reason": null,
+  "failure_class": null
+}

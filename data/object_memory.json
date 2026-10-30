@@ -1,0 +1,17 @@
+{
+  "label": "cup",
+  "world_mm": [
+    888.7,
+    55.3,
+    44.8
+  ],
+  "first_seen_world_mm": [
+    883.8,
+    54.7,
+    50.5
+  ],
+  "width_mm": 93.33712837843075,
+  "height_mm": null,
+  "sightings": 13,
+  "last_seen": 1793399128.5794203
+}
