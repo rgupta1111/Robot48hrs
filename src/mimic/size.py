@@ -100,3 +100,13 @@ def grip_position(width_mm, units_per_mm=10.0, squeeze_mm=1.0, max_position=850.
     units_per_mm is the gripper's position units per mm of opening (UFactory: 0-850; ~10/mm if 850 is ~85 mm - CHECK
     on your gripper). Returns a position clamped to [0, max_position]."""
     return float(min(max((width_mm - squeeze_mm) * units_per_mm, 0.0), max_position))
+
+
+def parse_viam_depth(data):
+    """Viam's raw depth image (mime image/vnd.viam.dep: 'DEPTHMAP', width, height as big-endian uint64, then big-endian
+    uint16 mm) -> (H, W) float array in mm, or None if it is not that format."""
+    import struct
+    if data[:8] != b"DEPTHMAP":
+        return None
+    w, h = struct.unpack(">QQ", data[8:24])
+    return np.frombuffer(data[24:24 + w * h * 2], ">u2").reshape(h, w).astype(float)
