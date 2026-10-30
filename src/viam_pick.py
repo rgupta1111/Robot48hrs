@@ -437,6 +437,7 @@ async def main_async(args):
             else:
                 print(f"[look {i + 1}] no {args.object} seen", flush=True)
             await asyncio.sleep(0.5)
+        hold = args.hold_mm if args.hold_mm is not None else args.tip_ahead_mm / 2.0
         not_in_view = tgt is None
         known0 = (eye.expected if not_in_view else tgt["world"])      # None: nothing seen and nothing remembered
         if not_in_view and not real:
@@ -538,9 +539,9 @@ async def main_async(args):
                 print(f"[C {cycle}] aligning: {lat:.0f} mm off-axis, {along:.0f} mm ahead" + (f", backing off {back:.0f} mm" if back else "")
                       + ("" if t else " (out of view)"), flush=True)
                 continue
-            if along <= args.hold_mm + args.tol_mm:
+            if along <= hold + args.grasp_tol_mm:
                 break
-            adv = min(args.step_mm, along - args.hold_mm)
+            adv = min(args.step_mm, along - hold)
             await go_rel(np.array([cap(rel[0]), cap(rel[1]), adv]), touch_ok=along <= args.clearance_mm + args.step_mm, obstacle_rel=rel)
             print(f"[C {cycle}] {along:.0f} mm along the axis, {lat:.0f} mm off to the side" + ("" if t else " (out of view)"), flush=True)
         else:
@@ -553,7 +554,7 @@ async def main_async(args):
             rel = t["rel_mm"]
             along, lat = float(rel[2]), float(np.hypot(rel[0], rel[1]))
             print(f"final check: {along:.0f} mm along, {lat:.0f} mm to the side", flush=True)
-            if lat > args.lat_tol_mm or along > args.hold_mm + 60:
+            if lat > args.lat_tol_mm or along > hold + 45:
                 raise SystemExit("the object is no longer lined up with the gripper (moved?): not closing")
         width = args.grip_width_mm or eye.width_estimate()
         if width is None or not 25.0 <= width <= 80.0:
@@ -600,7 +601,11 @@ def main():
     ap.add_argument("--lat-step-mm", type=float, default=25.0, help="longest sideways correction per step")
     ap.add_argument("--blind-lat-mm", type=float, default=400.0, help="out of view it goes to the REMEMBERED position in capped, planned steps; "
                     "refuse if that is further than this off the gripper axis (a wrong memory)")
-    ap.add_argument("--hold-mm", type=float, default=0.0, help="stop this far short of the object centre along the gripper axis")
+    ap.add_argument("--tip-ahead-mm", type=float, default=35.0, help="the fingertips are this far ahead of the gripper frame's origin "
+                    "(measured: camera -> gripper base 100 mm, camera -> fingertips 135 mm; the frame origin is at the base)")
+    ap.add_argument("--hold-mm", type=float, help="final stop: the object's centre this far ahead of the gripper frame's origin "
+                    "(default: halfway along the claws = tip-ahead / 2, so the object sits between the fingers)")
+    ap.add_argument("--grasp-tol-mm", type=float, default=8.0, help="stop the final advance when within this of the hold point")
     ap.add_argument("--step-mm", type=float, default=100.0, help="longest planned step (shorter = reacts faster to a moved object)")
     ap.add_argument("--tol-mm", type=float, default=30.0)
     ap.add_argument("--lat-tol-mm", type=float, default=25.0, help="max sideways error to still close")
