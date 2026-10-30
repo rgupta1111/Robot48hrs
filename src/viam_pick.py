@@ -112,6 +112,9 @@ class ObjectMemory:
         return True
 
 
+_UI_HOLD = {}
+
+
 class GraspFailed(Exception):
     """The grasp did not work (nothing in the gripper / object moved away): the whole attempt can be retried from the start pose."""
 
@@ -425,11 +428,15 @@ async def main_async(args):
                     return view["text"]
                 return "I understand: pick up the <object>, stop, pause, resume, yes / no, what do you see."
 
-            ui = UIServer(on_text, lambda: {"mode": "LIVE ARM" if real else "DRY RUN", "state": view["state"], "target": eye.label, "question": view.get("question"), "choices": view.get("choices"),
-                                            "distance": None if view["dist"] is None else f"{view['dist']:.0f} cm"}, args.port).start()
-            print("UI:", ui.url, flush=True)
-            if not args.no_browser:
-                webbrowser.open(ui.url)
+            status_fn = (lambda: {"mode": "LIVE ARM" if real else "DRY RUN", "state": view["state"], "target": eye.label, "question": view.get("question"), "choices": view.get("choices"),
+                                            "distance": None if view["dist"] is None else f"{view['dist']:.0f} cm"})
+            if _UI_HOLD.get("ui") is None:                          # one page for the whole session: later rounds reuse it (same chat, same URL)
+                _UI_HOLD["ui"] = UIServer(on_text, status_fn, args.port).start()
+                print("UI:", _UI_HOLD["ui"].url, flush=True)
+                if not args.no_browser:
+                    webbrowser.open(_UI_HOLD["ui"].url)
+            ui = _UI_HOLD["ui"]
+            ui.on_text, ui.get_status = on_text, status_fn
             view["question"] = "What should I pick up?"
             view["choices"] = [{"label": "Cup", "send": "pick up the cup"}, {"label": "Bottle", "send": "pick up the bottle"}]
             while not flags["go"] and not flags["stop"]:            # watch the scene until told to go
@@ -770,23 +777,45 @@ async def main_async(args):
                 await check_j6()
                 j0 = list((await arm.get_joint_positions()).values)
                 offsets = [0.0] + [a_ * sg for a_ in np.arange(args.scan_step_deg, args.scan_deg + 1e-6, args.scan_step_deg) for sg in (1.0, -1.0)]
-                found = None
+                seen_people = []                                       # (distance from the base axis, pan offset, world position)
                 for off in offsets:
                     check_stop()
                     j = list(j0)
                     j[0] += off
                     await arm.move_to_joint_positions(JointPositions(values=j))
                     await asyncio.sleep(0.6)
+                    best = None
                     for _ in range(2):
-                        found = await eye.person_world()
-                        if found is not None:
-                            break
-                    say(f"  scan base {off:+.0f} deg: " + ("person found" if found is not None else "nobody"), flush=True)
-                    if found is not None:
-                        break
-                if found is None:
+                        w_ = await eye.person_world()
+                        if w_ is not None and (best is None or np.hypot(w_[0], w_[1]) < np.hypot(best[0], best[1])):
+                            best = w_
+                    say(f"  scan base {off:+.0f} deg: " + (f"person at {np.hypot(best[0], best[1]) / 10:.0f} cm from the base" if best is not None else "nobody"), flush=True)
+                    if best is not None:
+                        seen_people.append((float(np.hypot(best[0], best[1])), off, best))
+                if not seen_people:
                     await arm.move_to_joint_positions(JointPositions(values=j0))
+                    return None
+                dist_, off_, found = min(seen_people, key=lambda x: x[0])
+                say(f"  closest person: {dist_ / 10:.0f} cm from the base (base {off_:+.0f} deg): handing it to them", flush=True)
+                j = list(j0)
+                j[0] += off_
+                await arm.move_to_joint_positions(JointPositions(values=j))
                 return found
+            finally:
+                try:
+                    await arm.do_command({"set_speed": float(args.arm_speed_dps)})
+                except Exception:
+                    pass
+
+        async def return_to_start():
+            """After the hand-over: wait for the person to step clear, then go back to the reset pose slowly, ready for the next pick."""
+            await asyncio.sleep(args.clear_s)
+            try:
+                await arm.do_command({"set_speed": float(args.handover_speed_dps)})
+            except Exception:
+                pass
+            try:
+                await arm.move_to_joint_positions(JointPositions(values=list(RESET_JOINTS)))
             finally:
                 try:
                     await arm.do_command({"set_speed": float(args.arm_speed_dps)})
@@ -809,8 +838,6 @@ async def main_async(args):
             else:
                 spot = np.array([float(v) for v in args.handover_xyz.split(",")])
                 say(f"no person seen: I will hold it out at x{spot[0]:.0f} y{spot[1]:.0f} z{spot[2]:.0f}")
-            if not await confirm(f"HAND OVER: move the {eye.label} to x{spot[0]:.0f} y{spot[1]:.0f} z{spot[2]:.0f} and hold it out for you to take."):
-                return
             async def speed(dps):
                 try:
                     await arm.do_command({"set_speed": float(dps)})
@@ -821,27 +848,37 @@ async def main_async(args):
                 gp = await gripper_pose()
                 await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=at(spot, gp)))
                 await check_j6()
-                show("handover", "holding it out: take it, or say 'release'")
-                say(f"Holding the {eye.label} out. Take it: I let go when I feel a steady pull, or reply 'release' / 'yes'.")
+                show("handover", "holding it out: waiting for your yes to release")
+                say(f"Holding the {eye.label} out to the closest person. Press YES (or type yes) when they have it and I will let go.")
                 await asyncio.sleep(2.0)                               # let the arm settle, then read the baseline load
                 base = np.array((await arm.do_command({"load": ""})).get("load", [0.0] * 6), float)
                 flags["yes"] = None
-                t0, since, taken = time.monotonic(), None, False
-                while time.monotonic() - t0 < args.handover_wait_s and not flags["stop"]:
-                    if flags["yes"]:
-                        say("released on your command")
-                        taken = True
-                        break
-                    load = np.array((await arm.do_command({"load": ""})).get("load", [0.0] * 6), float)
-                    if float(np.max(np.abs(load - base))) > args.pull_load:
-                        since = since or time.monotonic()               # a spike does not count: the pull must last
-                        if time.monotonic() - since >= args.pull_hold_s:
-                            say("felt a steady pull: letting go")
+                t0, since, taken, told = time.monotonic(), None, False, False
+                view["question"] = f"Release the {eye.label} to the person?"
+                view["choices"] = [{"label": "Yes, release", "send": "yes"}, {"label": "No, keep holding", "send": "no"}]
+                try:
+                    while time.monotonic() - t0 < args.handover_wait_s and not flags["stop"]:
+                        if flags["yes"]:
+                            say("released on your yes")
                             taken = True
                             break
-                    else:
-                        since = None
-                    await asyncio.sleep(0.05)
+                        if flags["yes"] is False:
+                            flags["yes"] = None                         # 'no': keep holding and keep asking
+                            say("OK, still holding it.")
+                        load = np.array((await arm.do_command({"load": ""})).get("load", [0.0] * 6), float)
+                        if float(np.max(np.abs(load - base))) > args.pull_load:
+                            since = since or time.monotonic()
+                            if time.monotonic() - since >= args.pull_hold_s and not told:
+                                told = True
+                                say("I feel them pulling: press YES to let go.")
+                                if args.release_on_pull:
+                                    taken = True
+                                    break
+                        else:
+                            since = None
+                        await asyncio.sleep(0.05)
+                finally:
+                    view["question"], view["choices"] = None, None
                 if not taken:
                     say(f"nobody took it within {args.handover_wait_s:.0f} s: putting it back down")
                     await go_rel(np.array([0.0, 0.0, 0.0]))
@@ -1280,6 +1317,8 @@ async def main_async(args):
         show("lifted", "lifted")
         if not args.no_handover:
             await hand_over()
+            if args.keep_running:
+                await return_to_start()
         await asyncio.sleep(2.0)
     finally:
         try:
@@ -1410,6 +1449,9 @@ def main():
     ap.add_argument("--box-obstacle", action="store_true", help="size the planner's obstacle from the YOLO box (width and height measured with the "
                     "depth) instead of the voxel map's cluster")
     ap.add_argument("--grip-map", default="cup=70,bottle=45", help="grip opening (mm) per object, measured by hand. The camera's width reads 15-25 mm too wide (bottle: 61-72 mm against a real 40-50 mm), so objects not listed here fall back to the camera width; --grip-width-mm overrides everything")
+    ap.add_argument("--release-on-pull", action="store_true", help="let go as soon as a steady pull is felt (default: only on your YES)")
+    ap.add_argument("--keep-running", action="store_true", help="after a hand-over, return to the reset pose and ask for the next object, without exiting (STOP ends it)")
+    ap.add_argument("--clear-s", type=float, default=4.0, help="with --keep-running: seconds to wait after the hand-over before returning to the reset pose")
     ap.add_argument("--retries", type=int, default=2, help="after a failed grasp, start the whole pick again this many times (each retry is confirmed)")
     ap.add_argument("--no-grasp-check", dest="grasp_check", action="store_false", help="do not verify the grasp (fingers closed, cup left the table)")
     ap.add_argument("--open-pos", type=float, default=840.0, help="gripper position units when fully open (10 per mm)")
@@ -1421,7 +1463,10 @@ def main():
         while True:
             try:
                 asyncio.run(main_async(args))
-                break
+                if not args.keep_running:
+                    break
+                args.attempt = 0
+                print("\nready for the next pick: choose an object on the page (STOP ends it)\n", flush=True)
             except GraspFailed as e:
                 args.attempt += 1
                 print(f"retrying ({e}): attempt {args.attempt + 1} of {args.retries + 1}", flush=True)
