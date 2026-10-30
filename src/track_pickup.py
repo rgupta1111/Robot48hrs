@@ -21,7 +21,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from arm_mimic import PRESETS, floats  # noqa: E402
 from local_detect import Lock, Range, detect, load_detector, object_candidates  # noqa: E402
-from mimic.pickup import check_jacobian, smooth_move  # noqa: E402
+from mimic.pickup import check_jacobian, smooth_move, table_floor_z  # noqa: E402
 from mimic.servo import (FeatureFilter, approach_factor, estimate_jacobian, features, servo_step,  # noqa: E402
                          tip_target_v)
 from tidy.robot import TableToWorld, ViamRobot  # noqa: E402
@@ -40,6 +40,9 @@ def main():
     ap.add_argument("--gripper-name", default="gripper")
     ap.add_argument("--sink", choices=["sim", "viam"], default="sim", help="sim = dry run, nothing moves")
     ap.add_argument("--bounds", default="250,600,-300,300,0,450", help="xmin,xmax,ymin,ymax,zmin,zmax mm; moves are clamped")
+    ap.add_argument("--table-z-mm", type=float, default=-123.0, help="table top height in the robot frame (the lab preset's)")
+    ap.add_argument("--tool-length-mm", type=float, default=105.0, help="flange-to-fingertip length of the gripper")
+    ap.add_argument("--table-margin-mm", type=float, default=30.0, help="keep the fingertips at least this far above the table")
     ap.add_argument("--stop-cm", type=float, default=10.0, help="close the gripper at this camera-to-object distance")
     ap.add_argument("--tip-offset-mm", type=float, default=0.0, help="the gripper sits this far below the camera")
     ap.add_argument("--tip-flip", action="store_true", help="the gripper is above the camera instead")
@@ -64,6 +67,10 @@ def main():
 
     real, bounds = args.sink == "viam", floats(args.bounds)
     lo, hi = np.array(bounds[0::2], float), np.array(bounds[1::2], float)
+    floor = table_floor_z(args.table_z_mm, args.tool_length_mm, args.table_margin_mm)
+    lo[2] = max(lo[2], floor)                          # never command a pose that puts the fingers into the table
+    print(f"table-safe floor: the tool never goes below z = {lo[2]:.0f} mm "
+          f"(table top {args.table_z_mm:.0f}, fingertips {args.tool_length_mm:.0f} mm below the tool, margin {args.table_margin_mm:.0f})")
     model, dargs = load_detector(args.object)
     robot = ViamRobot(args.viam_address, args.arm_name, args.gripper_name, None, TableToWorld(),
                       workspace=bounds[:4], max_z_mm=bounds[5])
@@ -110,6 +117,8 @@ def main():
     def probe():
         """How the object shifts in the image per mm of gripper motion (x, y, z); returns to the exact start after each."""
         start, J = position(), np.zeros((3, 3))
+        if start[2] < lo[2] - 1.0:
+            raise SystemExit(f"the tool is at z {start[2]:.0f} mm, below the table-safe floor {lo[2]:.0f} mm: raise the arm first")
         for i in range(3):
             before = at_rest()
             if before is None:
