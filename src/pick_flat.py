@@ -99,27 +99,35 @@ def main():
             return
         robot.set_gripper(True)
         time.sleep(1.0)
-        sign, last_abs_u, lost = -1.0, None, 0
-        for step in range(1, args.max_steps + 1):
+        # phase 1: centre the cup left/right with the base joint while it is still in view (it drops out of the bottom
+        # of the picture once the camera moves forward, so this must happen BEFORE the forward move)
+        sign, last_abs_u = -1.0, None
+        for it in range(1, 7):
             m = measure()
-            if m is not None and m[2] is not None and abs(m[2] - d_cm) <= 4.0:   # a believable reading
-                u, v, d_cm, clipped, w = m
-                lost = 0
-            else:                                                   # dead-reckon (cup out of view / bad depth)
-                lost += 1
-                u = None
-                if lost > 3 or d_cm > 14.0:
-                    raise SystemExit(f"lost the cup at {d_cm:.0f} cm; stopping")
+            if m is None or m[2] is None:
+                raise SystemExit("cannot see the cup to centre on it; stopping before any forward move")
+            u, v, d_cm, clipped, w = m
+            if abs(u) <= args.center_tol:
+                print(f"[centre {it}] cup u{u:+.2f}: centred, {d_cm:.1f} cm away", flush=True)
+                break
+            if last_abs_u is not None and abs(u) > last_abs_u + 0.02:
+                sign = -sign                                         # that made it worse: turn the other way
+            lateral_mm = u * (intr["w"] / intr["fx"] if intr else 1.4) * d_cm * 10.0      # sideways offset of the cup, mm
+            dth = float(np.clip(sign * math.degrees(lateral_mm / max(math.hypot(*position()[:2]), 1.0)) * 0.7, -4.0, 4.0))
+            robot.set_joint(0, robot.get_joints()[0] + dth)
+            last_abs_u = abs(u)
+            print(f"[centre {it}] cup u{u:+.2f} at {d_cm:.1f} cm: turned joint 1 by {dth:+.1f} deg", flush=True)
+            time.sleep(0.6)
+        else:
+            raise SystemExit("could not centre the cup in 6 turns; stopping before any forward move")
+        # phase 2: forward along the gripper axis. The cup slips out of the bottom of the picture on the way, so the
+        # distance is dead-reckoned (updated from the camera whenever the cup is visible and the reading is believable)
+        total_mm = max(d_cm - args.close_cm, 0.0) * 10.0
+        if not confirm(f"Centred. ADVANCE {total_mm:.0f} mm along the gripper axis (blind once the cup leaves the picture)."):
+            return
+        for step in range(1, args.max_steps + 1):
             if d_cm <= args.close_cm + 0.5:
                 break
-            if u is not None and abs(u) > args.center_tol:           # centre left/right with the base joint
-                if last_abs_u is not None and abs(u) > last_abs_u + 0.02:
-                    sign = -sign                                     # that made it worse: turn the other way
-                lateral_mm = u * (intr["w"] / intr["fx"] if intr else 1.4) * d_cm * 10.0      # sideways offset of the cup, mm
-                dth = float(np.clip(sign * math.degrees(lateral_mm / max(math.hypot(*position()[:2]), 1.0)) * 0.7, -3.0, 3.0))
-                robot.set_joint(0, robot.get_joints()[0] + dth)
-                last_abs_u = abs(u)
-                print(f"[{step:2}] cup u{u:+.2f} {d_cm:.1f} cm: turned joint 1 by {dth:+.1f} deg", flush=True)
             adv = min(args.step_mm, (d_cm - args.close_cm) * 10.0)
             pn = robot.get_pose()
             robot._orient = None
@@ -128,8 +136,12 @@ def main():
                 raise SystemExit("the next step is limited by the workspace bounds; stopping short of the cup")
             robot.move_xyz(*goal, wait=True)
             d_cm -= adv / 10.0
-            print(f"[{step:2}] advanced {adv:.0f} mm -> about {d_cm:.1f} cm to go; tool x{goal[0]:.0f} y{goal[1]:.0f} z{goal[2]:.0f}", flush=True)
             time.sleep(0.4)
+            m = measure()
+            seen = ""
+            if m is not None and m[2] is not None and abs(m[2] - d_cm) <= 4.0:
+                d_cm, seen = m[2], f" (camera agrees: {m[2]:.1f} cm, u{m[0]:+.2f})"
+            print(f"[advance {step:2}] {adv:.0f} mm -> about {d_cm:.1f} cm to go{seen}; tool x{goal[0]:.0f} y{goal[1]:.0f} z{goal[2]:.0f}", flush=True)
         else:
             raise SystemExit("did not reach the cup within the step limit")
         if not confirm(f"At about {d_cm:.0f} cm from the cup. CLOSE the gripper (force cap {args.max_torque}%) and lift."):
