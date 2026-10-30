@@ -1,6 +1,6 @@
 import numpy as np
 
-from mimic.size import WidthEstimator, box_depth_mm, scale_focal, width_from_depth
+from mimic.size import WidthEstimator, box_depth_mm, grip_position, scale_focal, width_from_depth
 
 
 FX = 900.0
@@ -46,3 +46,9 @@ def test_estimator_median_rejects_outliers_and_reports_sigma():
         reading = est.update(box, depth)
     assert abs(reading.width_mm - 80) < 3
     assert 0 < reading.sigma_mm < 3 and reading.n == 15
+
+
+def test_grip_position_squeezes_slightly_and_clamps():
+    assert grip_position(60, units_per_mm=10, squeeze_mm=1) == 590
+    assert grip_position(200, 10, 1) == 850      # wider than the gripper: clamped open
+    assert grip_position(0.5, 10, 1) == 0        # never negative

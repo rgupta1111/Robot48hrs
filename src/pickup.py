@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from arm_mimic import PRESETS, floats  # noqa: E402
 from mimic.pickup import PickupConfig, PickupPlanner  # noqa: E402
 from mimic.servo import estimate_jacobian, features  # noqa: E402
+from mimic.size import WidthEstimator, grip_position, scale_focal  # noqa: E402
 from tidy.robot import TableToWorld, ViamRobot  # noqa: E402
 
 
@@ -45,6 +46,14 @@ def main():
     ap.add_argument("--bounds", default="250,600,-300,300,0,450", help="xmin,xmax,ymin,ymax,zmin,zmax mm; moves are clamped")
     ap.add_argument("--min-confidence", type=float, default=0.35)
     ap.add_argument("--object-height-mm", type=float, default=100.0)
+    ap.add_argument("--segmenter", help="Viam vision service that gives 3D object positions (e.g. object-segmenter); "
+                    "its depth gives the true camera-to-object distance and lets the width be estimated")
+    ap.add_argument("--max-torque", type=int, default=30, help="grip force limit 1-100%% (UFactory G2 gripper only)")
+    ap.add_argument("--grip-speed", type=int, default=1500)
+    ap.add_argument("--units-per-mm", type=float, default=10.0, help="gripper position units per mm of opening (check it)")
+    ap.add_argument("--squeeze-mm", type=float, default=1.0, help="close this much tighter than the estimated width")
+    ap.add_argument("--min-width-mm", type=float, default=10.0)
+    ap.add_argument("--max-width-mm", type=float, default=80.0, help="refuse to grasp anything wider than this")
     ap.add_argument("--grasp-distance-mm", type=float, default=150.0)
     ap.add_argument("--target-uv", default="0,0", help="image offset (fractions of the frame) of the object at grasp")
     ap.add_argument("--probe-mm", type=float, default=20.0)
@@ -66,6 +75,9 @@ def main():
     _, intr = robot.camera_info(args.camera)
     fy = intr["fy"] if intr else None
     lo, hi = np.array(bounds[0::2], float), np.array(bounds[1::2], float)
+    widthest = WidthEstimator(intr["fx"]) if (args.segmenter and intr) else None
+    if args.segmenter and not intr:
+        print("camera reports no intrinsics: width estimation off, the gripper will close with its default force")
 
     def see():
         """-> (features, distance mm or None) of the best matching detection, or (None, None)."""
@@ -77,6 +89,16 @@ def main():
         h_img, w_img = frame.shape[:2] if frame is not None else ((intr["h"], intr["w"]) if intr else (720, 1280))
         s = features((d.x_min, d.y_min, d.x_max, d.y_max), w_img, h_img)
         dist = fy * args.object_height_mm / (s[2] * h_img) if fy and s[2] > 0 else None
+        if args.segmenter:                                  # true depth from the point cloud beats the height guess
+            _, objs = robot.objects(args.segmenter, args.camera)
+            objs = [o for o in objs if args.object.lower() in o[0].lower()]
+            if objs:
+                z = min(objs, key=lambda o: o[1][0] ** 2 + o[1][1] ** 2)[1][2]
+                if z > 0:
+                    dist = z
+                    if widthest is not None:
+                        widthest.fx = scale_focal(intr["fx"], intr["w"], w_img)
+                        widthest.update((d.x_min, d.y_min, d.x_max, d.y_max), z)
         return s, dist
 
     def position():
@@ -90,6 +112,29 @@ def main():
         target = np.clip(position() + np.asarray(delta, float), lo, hi)
         robot.move_xyz(*target, wait=True)
         time.sleep(args.settle)
+
+    def grasp(dry):
+        """Close onto the object with just enough squeeze: to the estimated width, force-limited where supported."""
+        r = widthest.reading() if widthest else None
+        if r is None:
+            print("no width estimate (need --segmenter and camera intrinsics): plain close at the gripper's default force")
+            if not dry and confirm("About to CLOSE the gripper."):
+                robot.set_gripper(False)
+            return
+        if not args.min_width_mm <= r.width_mm <= args.max_width_mm:
+            print(f"width {r.width_mm:.0f} mm is outside {args.min_width_mm:.0f}-{args.max_width_mm:.0f} mm: NOT grasping")
+            return
+        pos = grip_position(r.width_mm, args.units_per_mm, args.squeeze_mm)
+        print(f"object width {r.width_mm:.1f} +/- {r.sigma_mm:.1f} mm at {r.depth_mm:.0f} mm ({r.n} samples) -> "
+              f"close to position {pos:.0f}, torque limit {args.max_torque}%" + (" (dry run)" if dry else ""))
+        if dry or not confirm("About to CLOSE the gripper to that width."):
+            return
+        try:   # UFactory G2: close with a force limit
+            robot.gripper_command({"grab_with_torque": {"position": int(pos), "speed": args.grip_speed,
+                                                          "torque": args.max_torque}})
+        except Exception as e:
+            print(f"grab_with_torque unavailable ({type(e).__name__}); closing to the position without a force limit")
+            robot.gripper_command({"set": pos})
 
     def probe():
         """Learn how the object's image features respond to moving +x, +y, +z (then undo each move)."""
@@ -134,17 +179,15 @@ def main():
             if act.kind in ("done", "abort"):
                 break
             if not real:
-                if act.kind == "grip_close" or planner.state in ("DONE", "ABORT"):
-                    pass
+                if act.kind == "grip_close":
+                    grasp(dry=True)
                 time.sleep(0.3)
                 continue
             if act.kind == "grip_open":
                 robot.set_gripper(True)
                 time.sleep(1.0)
             elif act.kind == "grip_close":
-                if not confirm("About to CLOSE the gripper."):
-                    break
-                robot.set_gripper(False)
+                grasp(dry=False)
                 time.sleep(1.5)
             elif act.kind == "move":
                 move_by(act.move)

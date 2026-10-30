@@ -93,3 +93,10 @@ class WidthEstimator:
         ref = box if box is not None else (0.0, 0.0, width * self.fx / depth, 1.0)
         return WidthReading(width, width_uncertainty_mm(ref, depth, self.fx) / np.sqrt(len(self._widths)),
                             depth, len(self._widths))
+
+
+def grip_position(width_mm, units_per_mm=10.0, squeeze_mm=1.0, max_position=850.0):
+    """Gripper position command that closes onto an object of width_mm, squeezing squeeze_mm tighter than its width.
+    units_per_mm is the gripper's position units per mm of opening (UFactory: 0-850; ~10/mm if 850 is ~85 mm - CHECK
+    on your gripper). Returns a position clamped to [0, max_position]."""
+    return float(min(max((width_mm - squeeze_mm) * units_per_mm, 0.0), max_position))
