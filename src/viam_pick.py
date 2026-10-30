@@ -33,6 +33,7 @@ import numpy as np  # noqa: E402
 from viam.components.arm import Arm, JointPositions  # noqa: E402
 from viam.components.camera import Camera  # noqa: E402
 from viam.components.gripper import Gripper  # noqa: E402
+from mimic.runlog import RunLog, push_mongo  # noqa: E402
 from viam.proto.common import Geometry, GeometriesInFrame, Pose, PoseInFrame, RectangularPrism, Vector3, WorldState  # noqa: E402
 from viam.robot.client import RobotClient  # noqa: E402
 from viam.rpc.dial import DialOptions  # noqa: E402
@@ -290,14 +291,19 @@ async def main_async(args):
         view = {"text": "starting", "state": "starting", "dist": None}
         ui = None
 
+        runlog = RunLog(args)
+        runlog.metric("width_mm", memory.width)
+
         def say(msg, **_):
             print(msg, flush=True)
+            runlog.event(msg)
             if ui:
                 ui.say(msg)
 
         def show(state, text, dist=None):
             """Status text + the live camera frame with every detection (grey) and the locked one (green)."""
             view["state"], view["text"], view["dist"] = state, text, dist
+            runlog.stage(state, text)
             if not ui or eye.color is None:
                 return
             img = eye.color.copy()
@@ -1114,6 +1120,15 @@ async def main_async(args):
             memory.save()
         except Exception:
             pass
+        try:
+            runlog.metric("width_mm", memory.width)
+            runlog.metric("object_world_mm", None if memory.world is None else [round(float(v), 1) for v in memory.world])
+            runlog.finish(sys.exc_info()[1])
+            say(f"run log: {runlog.save()}  (success={runlog.doc['success']}, class={runlog.doc['failure_class']})")
+            if os.environ.get("MONGODB_URI") and not args.no_mongo:
+                push_mongo(runlog.doc, os.environ["MONGODB_URI"], args.mongo_db, args.mongo_coll)
+        except Exception as e:
+            print("run log failed:", e, flush=True)
         if real:
             try:
                 await arm.stop()
@@ -1148,6 +1163,9 @@ def main():
     ap.add_argument("--handover-wait-s", type=float, default=60.0, help="how long to wait for the person to take it, then put it down")
     ap.add_argument("--pull-hold-s", type=float, default=0.3, help="the pull must last this long before the gripper opens")
     ap.add_argument("--handover-settle-s", type=float, default=0.8, help="pause after opening, before backing away")
+    ap.add_argument("--no-mongo", action="store_true", help="do not send the run log to MongoDB even if MONGODB_URI is set")
+    ap.add_argument("--mongo-db", default="robot48")
+    ap.add_argument("--mongo-coll", default="pick_runs")
     ap.add_argument("--no-handover", action="store_true", help="do not hand the object to a person after lifting it")
     ap.add_argument("--handover-xyz", default="500,0,350", help="where to hold it out when no person is seen (world mm)")
     ap.add_argument("--handover-gap-mm", type=float, default=450.0, help="stay this far short of the person")
