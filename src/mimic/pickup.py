@@ -33,6 +33,14 @@ class Action:
     note: str = ""
 
 
+def smooth_move(prev, move, blend=0.5, max_mm=None):
+    """Blend a new move with the previous one (so the direction cannot flip between cycles) and cap its length.
+    blend 0 = no smoothing, 0.9 = very smooth but sluggish. max_mm is the longest allowed step (speed limit * dt)."""
+    m = blend * np.asarray(prev, float) + (1.0 - blend) * np.asarray(move, float)
+    n = float(np.linalg.norm(m))
+    return m * (max_mm / n) if max_mm is not None and n > max_mm else m
+
+
 def check_jacobian(J, min_response=1e-4, min_ratio=0.2):
     """Sanity-check a learned image response before servoing with it. -> an error message, or None when usable.
     Moving the gripper in x and y must shift the object differently in the image: if the x and y columns point the

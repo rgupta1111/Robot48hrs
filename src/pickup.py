@@ -24,8 +24,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from arm_mimic import PRESETS, floats  # noqa: E402
-from mimic.pickup import PickupConfig, PickupPlanner, check_jacobian  # noqa: E402
-from mimic.servo import estimate_jacobian, features  # noqa: E402
+from mimic.pickup import PickupConfig, PickupPlanner, check_jacobian, smooth_move  # noqa: E402
+from mimic.servo import FeatureFilter, estimate_jacobian, features  # noqa: E402
 from mimic.ui import UIServer  # noqa: E402
 from mimic.size import WidthEstimator, grip_position, scale_focal  # noqa: E402
 from tidy.robot import TableToWorld, ViamRobot  # noqa: E402
@@ -63,6 +63,10 @@ def main():
     ap.add_argument("--target-uv", default="0,0", help="image offset (fractions of the frame) of the object at grasp")
     ap.add_argument("--probe-mm", type=float, default=20.0)
     ap.add_argument("--gain", type=float, default=0.4)
+    ap.add_argument("--smooth", type=float, default=0.5, help="0..0.9 blend of each move with the previous one (higher = smoother)")
+    ap.add_argument("--feature-alpha", type=float, default=0.5, help="0..1 weight of the newest detection in the filtered "
+                    "cup position (lower = steadier, laggier)")
+    ap.add_argument("--max-speed", type=float, default=60.0, help="gripper speed limit during moves, mm/s")
     ap.add_argument("--max-step", type=float, default=30.0)
     ap.add_argument("--descend-step", type=float, default=25.0)
     ap.add_argument("--lift-mm", type=float, default=120.0)
@@ -287,11 +291,20 @@ def main():
         lock["centre"] = None
         if widthest is not None:
             widthest.reset()
+        flt, misses, prev_move, last_t = FeatureFilter(alpha=args.feature_alpha, beta=0.0), 0, np.zeros(3), time.monotonic()
         while not flags["stop"]:
             if flags["paused"]:
                 time.sleep(0.2)
                 continue
             s, dist = see()
+            now = time.monotonic()
+            dt, last_t = min(max(now - last_t, 0.2), 2.0), now
+            if s is not None:                               # steady the detection (box jitter) before deciding a move
+                s, misses = np.asarray(flt.update(s, now)), 0
+            else:
+                misses += 1
+                if misses > 3:
+                    flt.reset()
             act = planner.step(s, dist)
             seen = "not seen" if s is None else f"u{s[0]:+.2f} v{s[1]:+.2f} h{s[2]:.2f}" + (f" {dist:.0f}mm" if dist else "")
             print(f"[{planner.cycles:3}] {planner.state:8} {act.kind:10} {act.note:28} {seen}"
@@ -311,7 +324,11 @@ def main():
                 grasp(dry=False)
                 time.sleep(1.5)
             elif act.kind == "move":
-                move_by(act.move)
+                m = smooth_move(prev_move, act.move, args.smooth, args.max_speed * dt)
+                prev_move = m
+                move_by(m)
+            if act.kind != "move":
+                prev_move = np.zeros(3)
         return "stopped"
 
     J = None

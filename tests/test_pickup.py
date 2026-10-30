@@ -1,6 +1,6 @@
 import numpy as np
 
-from mimic.pickup import PickupConfig, PickupPlanner, check_jacobian
+from mimic.pickup import PickupConfig, PickupPlanner, check_jacobian, smooth_move
 
 J = np.array([[0.0, -0.004, 0.0], [-0.003, 0.0, 0.0], [0.0, 0.0, 0.001]])
 
@@ -80,3 +80,20 @@ def test_aborts_when_the_image_error_keeps_growing():
     p.step((0, 0, 0.2), 500)
     acts = [p.step((0.0, 0.3 + 0.03 * i, 0.2), 500) for i in range(6)]
     assert p.state == "ABORT" and any("growing" in a.note for a in acts)
+
+
+def test_smooth_move_blends_and_caps_speed():
+    assert np.allclose(smooth_move((10, 0, 0), (0, 10, 0), 0.5), (5, 5, 0))           # direction change is eased
+    assert np.allclose(smooth_move((0, 0, 0), (30, 40, 0), 0.0), (30, 40, 0))         # no smoothing: unchanged
+    capped = smooth_move((0, 0, 0), (30, 40, 0), 0.0, max_mm=10)
+    assert abs(np.linalg.norm(capped) - 10) < 1e-9 and np.allclose(capped, (6, 8, 0))  # speed limit keeps the direction
+
+
+def test_alternating_noise_gives_smaller_steps_than_raw():
+    rng, prev, raw, smoothed = np.random.default_rng(0), np.zeros(3), [], []
+    for _ in range(40):
+        m = np.array([20.0, 0.0, 0.0]) * rng.choice([-1, 1])                           # jittery +/- commands
+        prev = smooth_move(prev, m, 0.6)
+        raw.append(np.linalg.norm(m))
+        smoothed.append(np.linalg.norm(prev))
+    assert np.mean(smoothed) < 0.6 * np.mean(raw)
