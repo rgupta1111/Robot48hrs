@@ -86,7 +86,7 @@ def main():
 
     lock = {"centre": None, "seg_ok": bool(args.segmenter)}
     view = {"frame": None, "box": None, "text": "starting"}
-    flags = {"stop": False, "paused": False}
+    flags = {"stop": False, "paused": False, "yes": None, "go": not args.ui}
 
     def see():
         """-> (features, distance mm or None) of the locked cup. The first pick is the NEAREST cup (largest box, i.e.
@@ -138,7 +138,16 @@ def main():
         return np.array(robot.table.to_robot(p.x, p.y, p.z))
 
     def confirm(question):
-        return args.yes or input(f"{question} Type 'yes' to continue: ").strip().lower() == "yes"
+        if args.yes:
+            return True
+        if ui:                                              # answer in the chat box instead of the terminal
+            flags["yes"] = None
+            ui.say(question + " Reply 'yes' to continue or 'no' to cancel.")
+            t0 = time.monotonic()
+            while flags["yes"] is None and not flags["stop"] and time.monotonic() - t0 < 60:
+                time.sleep(0.2)
+            return bool(flags["yes"])
+        return input(f"{question} Type 'yes' to continue: ").strip().lower() == "yes"
 
     def move_by(delta):
         target = np.clip(position() + np.asarray(delta, float), lo, hi)
@@ -199,6 +208,18 @@ def main():
                 if real:
                     robot.stop()
                 return "Stopped. Nothing else will move."
+            if any(w in t for w in ("pick", "get", "grab", "fetch", "go to", "bring")):
+                if flags["go"]:
+                    return "Already on it."
+                flags["go"] = True
+                return (f"Going to get the {args.object}: centre, descend, grasp, lift." if real else
+                        f"DRY RUN: showing how I would get the {args.object}; nothing will move.")
+            if t.strip() in ("yes", "y", "confirm", "ok"):
+                flags["yes"] = True
+                return "OK."
+            if t.strip() in ("no", "n", "cancel"):
+                flags["yes"] = False
+                return "Cancelled."
             if "pause" in t:
                 flags["paused"] = True
                 return "Paused."
@@ -207,7 +228,7 @@ def main():
                 return "Resumed."
             if "see" in t or "status" in t:
                 return view["text"]
-            return "I understand: stop, pause, resume, status / what do you see."
+            return "I understand: pick up the cup, stop, pause, resume, status / what do you see, yes / no."
 
         def get_status():
             return {"mode": "LIVE ARM" if real else "DRY RUN", "state": view.get("state", "starting"), "target": args.object}
@@ -216,9 +237,8 @@ def main():
         print("UI:", ui.url, flush=True)
         webbrowser.open(ui.url)
 
-    def show(planner, act, seen):
-        view["text"] = f"{planner.state}: {act.kind} {act.note} - {seen}"
-        view["state"] = planner.state
+    def show(state, text):
+        view["text"], view["state"] = text, state
         if ui and view["frame"] is not None:
             img = view["frame"].copy()
             if view["box"] is not None:
@@ -231,18 +251,16 @@ def main():
             if ok:
                 ui.set_frame(buf.tobytes())
 
-    try:
-        if real:
-            if not confirm(f"The arm WILL move to pick up '{args.object}' (bounds {bounds}). E-stop in reach?"):
-                return
-            J = probe()
-        else:
-            J = np.array([[0.0, -0.004, 0.0], [-0.003, 0.0, 0.0], [0.0, 0.0, 0.001]])   # placeholder, never used to move
-            print("DRY RUN: nothing will move; showing what the planner would do each cycle")
-        cfg = PickupConfig(target_uv=floats(args.target_uv), gain=args.gain, max_step_mm=args.max_step,
-                           descend_step_mm=args.descend_step, grasp_distance_mm=args.grasp_distance_mm,
-                           lift_mm=args.lift_mm, max_cycles=args.max_cycles)
+    cfg = PickupConfig(target_uv=floats(args.target_uv), gain=args.gain, max_step_mm=args.max_step,
+                       descend_step_mm=args.descend_step, grasp_distance_mm=args.grasp_distance_mm,
+                       lift_mm=args.lift_mm, max_cycles=args.max_cycles)
+
+    def run_pickup(J):
+        """One pick-up attempt. Returns how it ended."""
         planner = PickupPlanner(J, cfg)
+        lock["centre"] = None
+        if widthest is not None:
+            widthest.reset()
         while not flags["stop"]:
             if flags["paused"]:
                 time.sleep(0.2)
@@ -252,9 +270,9 @@ def main():
             seen = "not seen" if s is None else f"u{s[0]:+.2f} v{s[1]:+.2f} h{s[2]:.2f}" + (f" {dist:.0f}mm" if dist else "")
             print(f"[{planner.cycles:3}] {planner.state:8} {act.kind:10} {act.note:28} {seen}"
                   + (f"  move {act.move[0]:+.0f} {act.move[1]:+.0f} {act.move[2]:+.0f}" if act.kind == "move" else ""), flush=True)
-            show(planner, act, seen)
+            show(planner.state, f"{act.kind} {act.note} - {seen}")
             if act.kind in ("done", "abort"):
-                break
+                return act.kind + (f" ({act.note})" if act.note else "")
             if not real:
                 if act.kind == "grip_close":
                     grasp(dry=True)
@@ -268,10 +286,38 @@ def main():
                 time.sleep(1.5)
             elif act.kind == "move":
                 move_by(act.move)
-        if ui and not flags["stop"]:
-            print("finished; UI stays up - Ctrl+C to quit", flush=True)
-            while not flags["stop"]:
-                time.sleep(0.5)
+        return "stopped"
+
+    J = None
+    try:
+        while not flags["stop"]:
+            if not flags["go"]:                             # UI mode: watch the cup until told to get it
+                s, dist = see()
+                show("waiting", ("cup in view" if s is not None else "no cup in view") + " - say 'pick up the cup'")
+                time.sleep(0.2)
+                continue
+            flags["go"] = not args.ui                       # one run per command in UI mode
+            if J is None:
+                if real:
+                    if not ui and not confirm(f"The arm WILL move to pick up '{args.object}' (bounds {bounds}). E-stop in reach?"):
+                        return
+                    if ui:
+                        ui.say("Learning how the camera responds: three small probe moves (about 20 mm each).")
+                    try:
+                        J = probe()
+                    except SystemExit as e:
+                        if not ui:
+                            raise
+                        ui.say(f"Cannot start: {e}")
+                        continue
+                else:
+                    J = np.array([[0.0, -0.004, 0.0], [-0.003, 0.0, 0.0], [0.0, 0.0, 0.001]])   # placeholder, never used to move
+                    print("DRY RUN: nothing will move; showing what the planner would do each cycle")
+            result = run_pickup(J)
+            print("result:", result, flush=True)
+            if not ui:
+                break
+            ui.say(f"Pickup finished: {result}. Say 'pick up the cup' to try again.")
     except KeyboardInterrupt:
         print("interrupted")
     finally:
