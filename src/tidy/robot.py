@@ -8,6 +8,7 @@ import math
 import os
 import sys
 import threading
+import time
 from dataclasses import dataclass
 
 
@@ -75,6 +76,18 @@ class ViamRobot:
     def _run(self, coro, timeout=120):
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout)
 
+    def _run_retry(self, make_coro, tries=4, timeout=120):
+        """Like _run, but retries when the machine says the session expired (a dropped connection stops the arm, then
+        the SDK reconnects). Only for idempotent commands such as moving to an absolute pose."""
+        for attempt in range(tries):
+            try:
+                return self._run(make_coro(), timeout)
+            except Exception as e:
+                if "SESSION_EXPIRED" not in str(e) or attempt == tries - 1:
+                    raise
+                print(f"session expired; reconnecting and retrying ({attempt + 1}/{tries - 1})", flush=True)
+                time.sleep(2.0)
+
     # --- joints (degrees, numbered as in the Viam app's arm panel) ---------------
     def get_joints(self):
         return list(self._run(self.arm.get_joint_positions()).values)
@@ -136,9 +149,10 @@ class ViamRobot:
         self._orient = cur
         wx, wy, wz = self.table.apply(x, y, z)
         pose = Pose(x=wx, y=wy, z=wz, o_x=cur.o_x, o_y=cur.o_y, o_z=cur.o_z, theta=cur.theta)
-        coro = self._motion_move(pose) if self.allow_collisions else self.arm.move_to_position(pose)
-        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result(120) if wait else fut
+        make = (lambda: self._motion_move(pose)) if self.allow_collisions else (lambda: self.arm.move_to_position(pose))
+        if wait:
+            return self._run_retry(make)
+        return asyncio.run_coroutine_threadsafe(make(), self._loop)
 
     def get_pose(self):
         """Current tool pose in the arm frame: Viam Pose (x, y, z mm; o_x, o_y, o_z; theta deg)."""

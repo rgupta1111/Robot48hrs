@@ -218,7 +218,11 @@ def main():
             robot.move_xyz(*target, wait=True)
             time.sleep(args.settle + 0.4)                   # let the arm stop and the camera catch up
             after = at_rest()
-            robot.move_xyz(*start, wait=True)
+            try:
+                robot.move_xyz(*start, wait=True)
+            except Exception as e:
+                raise SystemExit(f"probe: could not return to the start position ({type(e).__name__}); the arm is up to "
+                                 f"{args.probe_mm:.0f} mm away along {'xyz'[i]} - check it before retrying")
             time.sleep(args.settle + 0.4)
             if after is None:
                 raise SystemExit("probe: lost the object during a probe move; centre it in view first")
@@ -361,7 +365,17 @@ def main():
                 else:
                     J = np.array([[0.0, -0.004, 0.0], [-0.003, 0.0, 0.0], [0.0, 0.0, 0.001]])   # placeholder, never used to move
                     print("DRY RUN: nothing will move; showing what the planner would do each cycle")
-            result = run_pickup(J)
+            try:
+                result = run_pickup(J)
+            except Exception as e:                          # keep the page alive and say what happened
+                if not ui:
+                    raise
+                try:
+                    robot.stop()
+                except Exception:
+                    pass
+                ui.say(f"Run failed and the arm was told to stop: {type(e).__name__}: {e}")
+                continue
             print("result:", result, flush=True)
             if not ui:
                 break
