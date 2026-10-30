@@ -1,6 +1,6 @@
 import numpy as np
 
-from mimic.servo import FeatureFilter, approach_factor, estimate_jacobian, features, servo_step
+from mimic.servo import FeatureFilter, approach_factor, tip_target_v, estimate_jacobian, features, servo_step
 
 
 def world(J_true, s0):
@@ -65,3 +65,12 @@ def test_approach_factor_tapers_smoothly_instead_of_switching():
     vals = [approach_factor((0.0, e), db) for e in np.linspace(0.05, 0.13, 20)]
     assert all(a >= b for a, b in zip(vals, vals[1:]))       # never increases as the error grows
     assert max(abs(a - b) for a, b in zip(vals, vals[1:])) < 0.2   # no jump between neighbouring errors
+
+
+def test_tip_target_v_grows_as_the_object_gets_closer_and_is_clipped():
+    f, h = 450.0, 360                                   # 640x360 frame, ~450 px focal length
+    far, near = tip_target_v(60, 60, f, h), tip_target_v(25, 60, f, h)
+    assert 0 < far < near <= 0.42
+    assert abs(far - 60 * f / (600 * h)) < 1e-9          # 6 cm offset seen from 60 cm
+    assert tip_target_v(10, 60, f, h) == 0.42            # too close: the true aim point is out of view
+    assert tip_target_v(None, 60, f, h) == 0.0 and tip_target_v(30, 0, f, h) == 0.0

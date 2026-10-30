@@ -68,3 +68,13 @@ def approach_factor(err_uv, deadband):
     on/off switch at 2 x deadband that flipped every few steps when the error hovered around it (visible jitter)."""
     e = float(np.max(np.abs(np.asarray(err_uv, float))))
     return float(np.clip((4.0 * deadband - e) / (2.0 * deadband), 0.0, 1.0))
+
+
+def tip_target_v(dist_cm, offset_mm, focal_px, frame_h_px, max_v=0.42):
+    """Where (vertical image fraction, +down) the object must appear for a gripper that sits offset_mm below the camera
+    (parallel to its axis) to be pointing at it. The camera sees the gripper's axis at v = offset * f / (distance * H):
+    it grows as the object gets closer, so centring the object (v = 0) aims the gripper offset_mm too low. Clipped to
+    max_v so the target stays inside the picture (closer than offset*f/(max_v*H) the true aim point is out of view)."""
+    if not dist_cm or dist_cm <= 0:
+        return 0.0
+    return float(np.clip(offset_mm * focal_px / (dist_cm * 10.0 * frame_h_px), 0.0, max_v))

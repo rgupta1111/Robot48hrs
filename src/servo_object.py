@@ -46,7 +46,7 @@ from local_detect import (COLORS, Lock, Range, color_candidates, crop_gray, dete
                           load_detector, object_candidates, roi_candidates, template_candidates)
 from mimic.chat import HELP, parse  # noqa: E402
 from mimic.pipeline import FrameGrabber, MoveWorker, Perception  # noqa: E402
-from mimic.servo import FeatureFilter, approach_factor, estimate_jacobian, features, servo_step  # noqa: E402
+from mimic.servo import FeatureFilter, approach_factor, estimate_jacobian, features, servo_step, tip_target_v  # noqa: E402
 from mimic.ui import UIServer  # noqa: E402
 from reset_position import RESET_JOINTS  # noqa: E402
 from tidy.robot import TableToWorld, ViamRobot  # noqa: E402
@@ -104,6 +104,9 @@ def main():
     ap.add_argument("--search-steps", type=int, default=5, help="moves toward where the cup vanished before holding")
     ap.add_argument("--bounds", default="250,600,-300,300,0,450")
     ap.add_argument("--ui", action="store_true", help="serve the chat page on http://127.0.0.1:PORT/ and open it")
+    ap.add_argument("--tip-offset-mm", type=float, default=0.0, help="the gripper sits this far BELOW the camera: aim so the "
+                    "gripper, not the camera axis, points at the object (0 = centre the object in the image, as before)")
+    ap.add_argument("--tip-flip", action="store_true", help="the gripper is ABOVE the camera in the image instead")
     ap.add_argument("--grasp", action="store_true", help="on arrival: ask in the chat, then close the gripper (force-capped) and lift")
     ap.add_argument("--lift-mm", type=float, default=120.0, help="--grasp: how far to lift after closing")
     ap.add_argument("--max-torque", type=int, default=30, help="--grasp: grip force limit 1-100%% (UFactory G2 gripper only)")
@@ -461,10 +464,15 @@ def main():
                             pend = sum((m for ts, m in hist if ts > r.t - args.lag), np.zeros(3))
                             s = s + J @ pend
                         last_s, lost_n = s, 0
+                        if args.tip_offset_mm and dist_cm:          # parallax: the aim point moves down the image as it gets close
+                            f_px = (rng.focal_px * r.frame.shape[1] / rng.focal_w if rng.focal_px
+                                    else r.frame.shape[1] / (2 * np.tan(np.radians(args.hfov) / 2)))
+                            target[1] = (-1 if args.tip_flip else 1) * tip_target_v(dist_cm, args.tip_offset_mm, f_px, r.frame.shape[0])
                         tgt, fu = target, feats
                         status = "tracking"
                         err = tgt[list(fu)] - s[list(fu)]
-                        err_txt = f"offset u{s[0]:+.2f} v{s[1]:+.2f}" + ("" if dist_cm is None else f"  {dist_cm:.0f} cm")
+                        err_txt = (f"offset u{s[0]:+.2f} v{s[1]:+.2f}" + (f" (aim v{target[1]:+.2f})" if args.tip_offset_mm else "")
+                                   + ("" if dist_cm is None else f"  {dist_cm:.0f} cm"))
                         near = np.max(np.abs(err[:2])) < args.deadband
                         if args.touch and dist_cm is not None:
                             if abs(J[2]).max() < 1e-5:
@@ -479,7 +487,7 @@ def main():
                                 closer = (args.approach_speed / 10.0 * min(max(dtick, 0.05), 0.5)
                                           * approach_factor(err[:2], args.deadband))
                                 d_goal = max(stop_cm, dist_cm - closer)
-                                tgt = np.array([0.0, 0.0, s[2] * dist_cm / d_goal])   # size grows as the distance shrinks
+                                tgt = np.array([target[0], target[1], s[2] * dist_cm / d_goal])   # size grows as the distance shrinks
                                 fu, near = (0, 1, 2), False
                         if status.startswith("ARRIVED") or status.startswith("no depth"):
                             cmd_pos = shared["cur"].copy()
