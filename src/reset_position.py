@@ -14,7 +14,7 @@ from arm_mimic import PRESETS, floats  # noqa: E402
 from tidy.robot import ViamRobot  # noqa: E402
 
 # degrees, joint 0..5 - read from the Viam app's joint panel at the arm's reset pose
-RESET_JOINTS = (-0.95, 33.21, -28.59, -86.05, 8.90, -272.49)
+RESET_JOINTS = (-0.95, 33.20, -18.66, -86.01, 8.92, -272.45)
 
 
 def main():

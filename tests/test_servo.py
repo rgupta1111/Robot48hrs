@@ -56,3 +56,10 @@ def test_filter_smooths_noise_and_estimates_velocity():
     assert np.mean(errs) < np.mean(raw)                              # less jitter than the raw detections
     assert abs(f.v[0] - 0.05) < 0.04                                 # sees the motion
     assert abs(f.predict(0.5)[0] - (0.05 * 5.9 + 0.025)) < 0.05      # and leads it
+
+
+def test_features_aim_at_the_lower_half():
+    box = (600, 300, 680, 420)                       # 80 x 120 px, centred in a 1280x720 frame
+    assert np.allclose(features(box, 1280, 720), (0.0, 0.0, 120 / 720))
+    u, v, h = features(box, 1280, 720, aim=0.75)     # the lower-half point is 30 px below the box centre
+    assert u == 0 and abs(v - 30 / 720) < 1e-9

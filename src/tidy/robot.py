@@ -58,6 +58,8 @@ class ViamRobot:
                 raise SystemExit("set VIAM_API_KEY and VIAM_API_KEY_ID (or pass --viam-insecure for a local server)")
             dial = DialOptions.with_api_key(key, key_id)
         self._robot = self._run(RobotClient.at_address(address, RobotClient.Options(dial_options=dial)))
+        self._address, self._dial = address, dial
+        self._cam_robot, self._cams, self._cam_gen, self._cam_lock = None, {}, 0, threading.Lock()   # camera has its own connection
 
         arms = [r.name for r in self._robot.resource_names if r.subtype == "arm"]
         if arm_name not in arms:
@@ -174,15 +176,36 @@ class ViamRobot:
     def camera_names(self):
         return [r.name for r in self._robot.resource_names if r.subtype == "camera"]
 
+    def _cam_client(self, real):
+        """A camera client on a DEDICATED connection to the machine, so a hiccup of the video link cannot disturb arm commands."""
+        from viam.components.camera import CameraClient
+        from viam.robot.client import RobotClient
+        with self._cam_lock:
+            if self._cam_robot is None:
+                self._cam_robot = self._run(RobotClient.at_address(self._address, RobotClient.Options(dial_options=self._dial)),
+                                            timeout=60)
+            if real not in self._cams:
+                self._cams[real] = CameraClient(real, self._cam_robot._channel)
+            return self._cams[real], self._cam_gen
+
+    def _cam_reset(self, gen):
+        """Drop the camera connection (once per failure, however many threads noticed) so the next call dials again."""
+        with self._cam_lock:
+            if gen != self._cam_gen:
+                return
+            old, self._cam_robot, self._cams, self._cam_gen = self._cam_robot, None, {}, self._cam_gen + 1
+        if old is not None:
+            try:
+                self._run(old.close(), timeout=5)
+            except Exception:
+                pass
+
     def get_frame(self, camera_name):
-        """One BGR frame (numpy array) from a Viam camera component."""
+        """One BGR frame (numpy array) from a Viam camera component. If the video connection breaks it re-dials once."""
         import cv2
         import numpy as np
-        from viam.components.camera import Camera
-        cams = getattr(self, "_cams", None)
-        if cams is None:
-            cams = self._cams = {}
-        if camera_name not in cams:
+        real = getattr(self, "_cam_real", {}).get(camera_name)
+        if real is None:
             found = self.camera_names()
             real = camera_name
             if camera_name not in found:
@@ -190,19 +213,24 @@ class ViamRobot:
                     raise SystemExit(f"camera {camera_name!r} not found; machine has cameras: {found or 'none'}")
                 real = found[0]
                 print(f"camera {camera_name!r} not found, using the only camera: {real!r}")
+            if not hasattr(self, "_cam_real"):
+                self._cam_real = {}
+            self._cam_real[camera_name] = real
+        for attempt in (0, 1):
+            cam, gen = self._cam_client(real)
             try:
-                cams[camera_name] = Camera.from_robot(self._robot, real)
-            except Exception:  # the SDK's resource manager missed it (seen on sfhack16-main): dial the API directly
-                from viam.components.camera import CameraClient
-                cams[camera_name] = CameraClient(real, self._robot._channel)
-        cam = cams[camera_name]
-        if hasattr(cam, "get_image"):
-            img = self._run(cam.get_image(mime_type="image/jpeg"))
-        else:  # newer SDKs only have get_images -> (list of NamedImage, metadata)
-            imgs = self._run(cam.get_images())[0]
-            img = next((i for i in imgs if "depth" not in str(i.mime_type).lower()), None)
-            if img is None:
-                return None
+                if hasattr(cam, "get_image"):
+                    img = self._run(cam.get_image(mime_type="image/jpeg"), timeout=30)
+                else:  # newer SDKs only have get_images -> (list of NamedImage, metadata)
+                    imgs = self._run(cam.get_images(), timeout=30)[0]
+                    img = next((i for i in imgs if "depth" not in str(i.mime_type).lower()), None)
+                    if img is None:
+                        return None
+                break
+            except Exception:
+                self._cam_reset(gen)
+                if attempt == 1:
+                    raise
         data = getattr(img, "data", None)
         if data is None:  # older SDKs return a PIL image
             return cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
@@ -287,6 +315,26 @@ class ViamRobot:
         if self.gripper is not None:
             self._run(self.gripper.open() if is_open else self.gripper.grab())
 
+    def grab(self, force=None, do_command=None):
+        """Close the gripper. `force` goes to the driver as extra={"force": force}; `do_command` is an optional dict sent
+        with the gripper's DoCommand first (for drivers that set the force that way). -> True if it reports holding."""
+        if self.gripper is None:
+            return False
+        if do_command:
+            self._run(self.gripper.do_command(do_command))
+        extra = {"force": float(force)} if force is not None else None
+        return bool(self._run(self.gripper.grab(extra=extra)))
+
+    def is_holding(self):
+        """True / False from the gripper's own sensing, or None if the driver cannot tell."""
+        if self.gripper is None:
+            return None
+        try:
+            res = self._run(self.gripper.is_holding_something())
+            return bool(getattr(res, "is_holding_something", res))
+        except Exception:
+            return None
+
     def stop(self):
         self._run(self.arm.stop())
         if self.gripper is not None:
@@ -294,6 +342,11 @@ class ViamRobot:
 
     def close(self):
         try:
+            if getattr(self, "_cam_robot", None) is not None:
+                try:
+                    self._run(self._cam_robot.close(), timeout=5)
+                except Exception:
+                    pass
             if getattr(self, "_robot", None) is not None:
                 self._run(self._robot.close(), timeout=10)
         finally:

@@ -36,7 +36,7 @@ button.send{background:var(--acc);border-color:var(--acc);color:#fff}
 .side{display:flex;flex-direction:column;gap:12px;min-height:0}
 </style></head><body><main>
 <div class="side"><div class="card"><div class="video"><img id="cam" alt="camera"><span id="mode" class="badge dry">DRY RUN</span></div>
-<div class="stats" id="stats"></div><pre class="plan" id="plan"></pre></div>
+<div class="stats" id="stats"></div><div class="stats" id="joints" style="font-family:ui-monospace,Menlo,monospace"></div><pre class="plan" id="plan"></pre></div>
 <button id="stop">STOP ARM</button></div>
 <div class="card"><div id="log"></div>
 <div class="chips" id="chips"></div>
@@ -48,20 +48,21 @@ async function send(text){if(!text.trim())return;await fetch('/chat',{method:'PO
 document.getElementById('f').onsubmit=e=>{e.preventDefault();send(t.value);t.value=''};
 document.getElementById('stop').onclick=()=>send('stop');
 for(const c of ['go to the cup','yes','stop','what do you see','status','help']){const b=document.createElement('button');b.textContent=c;b.onclick=()=>send(c);document.getElementById('chips').appendChild(b)}
-const cam=document.getElementById('cam');
+const cam=document.getElementById('cam');cam.style.cursor='crosshair';cam.title='click an object to select it';
+cam.onclick=e=>{const r=cam.getBoundingClientRect();fetch('/click',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:(e.clientX-r.left)/r.width,y:(e.clientY-r.top)/r.height})})};
 async function frame(){try{const r=await fetch('/frame.jpg?'+Date.now());if(r.ok){const u=URL.createObjectURL(await r.blob());const o=cam.src;cam.src=u;if(o.startsWith('blob:'))URL.revokeObjectURL(o)}}catch(e){}setTimeout(frame,70)}frame();
 async function poll(){try{
  const m=await (await fetch('/messages?after='+last)).json();for(const x of m.messages){add(x.who,x.text);last=x.id}
  const s=await (await fetch('/status')).json();const mode=document.getElementById('mode');mode.textContent=s.mode;mode.className='badge '+(s.mode==='LIVE ARM'?'live':'dry');
  const f=(k,v)=>v===undefined||v===null||v===''?'':`<span>${k} <b>${v}</b></span>`;
- document.getElementById('plan').textContent=(s.plan||[]).join('\n');document.getElementById('stats').innerHTML=f('target',s.target)+f('state',s.state)+f('distance',s.distance)+f('stop at',s.stop_at)+f('cam fps',s.cam_fps)+f('detector fps',s.det_fps)
+ document.getElementById('joints').textContent=s.joints||'';document.getElementById('plan').textContent=(s.plan||[]).join('\n');document.getElementById('stats').innerHTML=f('target',s.target)+f('state',s.state)+f('distance',s.distance)+f('stop at',s.stop_at)+f('clearance',s.clearance)+f('tilt',s.tilt)+f('cam fps',s.cam_fps)+f('detector fps',s.det_fps)
 }catch(e){}setTimeout(poll,500)}poll();
 </script></body></html>"""
 
 
 class UIServer:
-    def __init__(self, on_text, get_status, port=8765, host="127.0.0.1"):
-        self.on_text, self.get_status, self.host, self.port = on_text, get_status, host, port
+    def __init__(self, on_text, get_status, port=8765, host="127.0.0.1", on_click=None):
+        self.on_text, self.get_status, self.host, self.port, self.on_click = on_text, get_status, host, port, on_click
         self._mu, self._messages, self._frame = threading.Lock(), [], None
         ui = self
 
@@ -115,7 +116,15 @@ class UIServer:
             def do_POST(self):
                 if not self._local():
                     return self._send(403, "local only", "text/plain")
-                if urlparse(self.path).path != "/chat":
+                path = urlparse(self.path).path
+                if path == "/click" and ui.on_click is not None:       # the user clicked the video: x, y as fractions of the picture
+                    try:
+                        d = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                        ui.on_click(float(d["x"]), float(d["y"]))
+                    except (ValueError, KeyError):
+                        return self._send(400, "bad click", "text/plain")
+                    return self._send(200, json.dumps({"ok": True}))
+                if path != "/chat":
                     return self._send(404, "not found", "text/plain")
                 try:
                     text = str(json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}").get("text", ""))[:500]

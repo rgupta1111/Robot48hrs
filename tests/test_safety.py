@@ -55,3 +55,13 @@ def test_depth_direction_leaves_image_position_alone():
     n2 = depth_direction(-J * [[1], [1], [-1]])             # reversed depth sign -> flipped direction
     assert n2 is not None
     assert depth_direction(np.array([[0.0, -0.004, 0.0], [-0.003, 0.0, 0.0], [0.0, 0.0, 0.0]])) is None
+
+
+def test_arm_clearance_measures_the_skeleton_not_just_the_tool():
+    o = Obstacles(margin_mm=0)
+    o.add((-1000, 1000, -1000, 1000, -1000, 0), "table")                  # table top at z = 0
+    gap, name = o.arm_clearance([[0, 0, 300], [200, 0, 300], [400, 0, 120]], radius_mm=40)
+    assert name == "table" and abs(gap - 80) < 1e-6                          # the tip is 120 above the table; minus the radius
+    gap2, _ = o.arm_clearance([[0, 0, 300], [200, 0, 100], [400, 0, 300]], radius_mm=40)
+    assert abs(gap2 - 60) < 1e-6                                              # an elbow dipping to 100 mm is caught between points
+    assert o.arm_clearance([[0, 0, 20]], radius_mm=40)[0] < 0                 # too low: negative = inside the safety shell

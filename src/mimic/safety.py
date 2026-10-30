@@ -98,6 +98,23 @@ class Obstacles:
             hit += h
         return cur, sorted(set(hit))
 
+    def arm_clearance(self, points, radius_mm=0.0, step_mm=20.0):
+        """Smallest gap (mm) between the arm's skeleton (polyline through `points`, robot frame) thickened by radius_mm and
+        any box. Negative = touching or inside. -> (gap, name of the nearest obstacle)."""
+        pts = [np.asarray(p, float) for p in points]
+        samples = []
+        for a, b in zip(pts[:-1], pts[1:]):
+            n = max(int(np.linalg.norm(b - a) // step_mm), 1)
+            samples += [a + (b - a) * (i / n) for i in range(n)]
+        samples.append(pts[-1])
+        best, name = float("inf"), ""
+        for b in self.boxes:
+            d = np.linalg.norm(np.maximum(np.maximum(b.lo - np.array(samples), np.array(samples) - b.hi), 0.0), axis=1)
+            g = float(d.min()) - radius_mm
+            if g < best:
+                best, name = g, b.name
+        return best, name
+
     # ---- loading from the machine ------------------------------------------------------------------------------
     @classmethod
     def from_viam(cls, robot, margin_mm=60.0, skip_names=()):

@@ -32,6 +32,7 @@ class FrameGrabber:
     def __init__(self, fetch, workers=4):
         self.fetch, self.workers = fetch, workers
         self._mu, self._frame, self._t, self.seq, self.fps = threading.Lock(), None, 0.0, 0, _Rate()
+        self._last_err, self._err_t = None, 0.0
         self._alive, self._threads, self.latency = True, [], 0.3        # latency: seconds one camera request takes
 
     def start(self):
@@ -47,8 +48,14 @@ class FrameGrabber:
             t0 = time.monotonic()
             try:
                 frame = self.fetch()
-            except Exception as e:  # keep grabbing
-                print("camera error:", e, flush=True)
+            except Exception as e:  # keep grabbing; say what went wrong (with the traceback the first time), not every 0.5 s
+                key = f"{type(e).__name__}: {e}"
+                if key != self._last_err or time.monotonic() - self._err_t > 10.0:
+                    import traceback
+                    print(f"camera error: {key}  (retrying; the video connection is re-dialled automatically)", flush=True)
+                    if key != self._last_err:
+                        traceback.print_exc()
+                    self._last_err, self._err_t = key, time.monotonic()
                 time.sleep(0.5)
                 continue
             if frame is None:

@@ -5,6 +5,8 @@ and its height as a fraction of the frame. Moving the gripper by d mm changes th
 LEARNED by small probe moves, so it absorbs the camera mounting, orientation and scale - nothing is assumed.
 Each step: d = gain * J+ (s_target - s), a damped least-squares move, limited in size.
 """
+import threading
+
 import numpy as np
 
 
@@ -27,9 +29,10 @@ def servo_step(J, s, s_target, features=(0, 1), gain=0.5, max_step_mm=40.0, damp
     return d * (max_step_mm / n) if n > max_step_mm else d
 
 
-def features(box, frame_w, frame_h):
-    """(x1, y1, x2, y2) pixels -> (u, v, h)."""
-    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+def features(box, frame_w, frame_h, aim=0.5):
+    """(x1, y1, x2, y2) pixels -> (u, v, h). (u, v) is where the AIM point of the box sits relative to the image centre:
+    aim=0.5 is the middle of the object, 0.75 the middle of its lower half (aim=1.0 the bottom edge)."""
+    cx, cy = (box[0] + box[2]) / 2, box[1] + aim * (box[3] - box[1])
     return np.array([cx / frame_w - 0.5, cy / frame_h - 0.5, (box[3] - box[1]) / frame_h])
 
 
@@ -39,23 +42,27 @@ class FeatureFilter:
 
     def __init__(self, alpha=0.6, beta=0.04, max_rate=1.0):
         self.alpha, self.beta, self.max_rate = alpha, beta, max_rate
+        self._mu = threading.Lock()                  # reset() may come from another thread than update()
         self.reset()
 
     def reset(self):
-        self.x = self.v = self.t = None
+        with self._mu:
+            self.x = self.v = self.t = None
 
     def update(self, s, t):
+        """-> a copy of the filtered features (safe to use even if reset() runs right after)."""
         s = np.asarray(s, float)
-        if self.x is None:
-            self.x, self.v, self.t = s.copy(), np.zeros_like(s), t
-            return self.x
-        dt = max(t - self.t, 1e-3)
-        pred = self.x + self.v * dt
-        r = s - pred
-        self.x = pred + self.alpha * r
-        self.v = np.clip(self.v + self.beta * r / dt, -self.max_rate, self.max_rate)
-        self.t = t
-        return self.x
+        with self._mu:
+            if self.x is None:
+                self.x, self.v, self.t = s.copy(), np.zeros_like(s), t
+                return self.x.copy()
+            dt = max(t - self.t, 1e-3)
+            pred = self.x + self.v * dt
+            r = s - pred
+            self.x = pred + self.alpha * r
+            self.v = np.clip(self.v + self.beta * r / dt, -self.max_rate, self.max_rate)
+            self.t = t
+            return self.x.copy()
 
     def predict(self, ahead_s):
         """Where the features will be ahead_s seconds after the last update."""

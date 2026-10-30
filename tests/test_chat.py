@@ -60,3 +60,36 @@ def test_settings_and_calibration():
     assert parse("calibrate 30 cm") == {"intent": "calibrate", "cm": 30.0}
     assert parse("the cup is 25 cm away") == {"intent": "calibrate", "cm": 25.0}
     assert intent("go") == "yes" and intent("execute the plan") == "yes"
+
+
+def test_pick_and_handover():
+    assert parse("pick up the cup") == {"intent": "pick", "name": "cup", "then": None}
+    assert parse("grab the bottle") == {"intent": "pick", "name": "bottle", "then": None}
+    assert parse("pick up the cup and bring it to the closest person") == {"intent": "pick", "name": "cup", "then": "person"}
+    assert parse("pick the cup up then give it to the nearest person") == {"intent": "pick", "name": "cup", "then": "person"}
+    assert parse("bring it to the closest person") == {"intent": "person"}
+    assert parse("hand it over to someone") == {"intent": "person"}
+    assert parse("go to the cup") == {"intent": "target", "name": "cup"}          # plain reaching is unchanged
+    assert parse("open the gripper") == {"intent": "gripper", "open": True}
+
+
+def test_object_width_from_above():
+    assert parse("the cup is 8 cm across") == {"intent": "set", "key": "object_top_mm", "value": 80.0}
+    assert parse("the cup is 9 cm tall") == {"intent": "set", "key": "object_height_mm", "value": 90.0}
+
+
+def test_choosing_between_several_cups():
+    assert parse("switch to the other cup") == {"intent": "switch", "which": "other"}
+    assert parse("the left one") == {"intent": "switch", "which": "left"}
+    assert parse("use the closest cup") == {"intent": "switch", "which": "closest"}
+    assert parse("cup 2") == {"intent": "switch", "which": 2}
+    assert parse("the second cup") == {"intent": "switch", "which": 2}
+    assert parse("go to the right cup") == {"intent": "target", "name": "cup", "which": "right"}
+    assert parse("pick up the other cup") == {"intent": "pick", "name": "cup", "then": None, "which": "other"}
+    assert parse("go to the cup") == {"intent": "target", "name": "cup"}          # unchanged without a qualifier
+    assert parse("stop") == {"intent": "stop"}
+
+
+def test_numbered_objects_other_than_cups():
+    assert parse("person 3") == {"intent": "target", "name": "person", "which": 3}      # the app turns this into a switch when already working on a person
+    assert parse("get within 5 cm of the cup") == {"intent": "target", "name": "cup", "stop_cm": 5.0}
