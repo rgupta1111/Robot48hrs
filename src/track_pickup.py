@@ -13,6 +13,7 @@ The gripper sits below the camera, so the object is not centred in the picture: 
 """
 import argparse
 import os
+import struct
 import sys
 import time
 import webbrowser
@@ -24,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from arm_mimic import PRESETS, floats  # noqa: E402
 from local_detect import Lock, Range, detect, load_detector, object_candidates  # noqa: E402
 from mimic.pickup import advance_along, check_jacobian, smooth_move, table_floor_z  # noqa: E402
+from mimic.size import box_depth_mm, width_from_depth  # noqa: E402
 from mimic.servo import (FeatureFilter, approach_factor, estimate_jacobian, features, servo_step,  # noqa: E402
                          tip_target_v)
 from mimic.ui import UIServer  # noqa: E402
@@ -72,8 +74,9 @@ def main():
     ap.add_argument("--approach-speed", type=float, default=80.0, help="closing speed, mm/s")
     ap.add_argument("--arm-speed", type=float, help="real arm joint speed, deg/s (UFactory: 15 slow, 30 medium, 60 fast)")
     ap.add_argument("--probe-mm", type=float, default=20.0)
-    ap.add_argument("--grip-width-mm", type=float, default=70.0, help="the object's width: the fingers close to this opening and cannot squeeze "
-                    "past it (70 mm held the cup). This gripper has no working force limit; a plain close crushed a cup.")
+    ap.add_argument("--grip-width-mm", type=float, help="the object's width: the fingers close to this opening and cannot squeeze "
+                    "past it (70 held the cup). Default: estimated from the camera's depth when it arrives. This gripper has no "
+                    "working force limit; a plain close crushed a cup.")
     ap.add_argument("--grip-speed", type=int, default=300, help="closing speed 1-5000 (low = gentle)")
     ap.add_argument("--lift-mm", type=float, default=120.0)
     ap.add_argument("--max-cycles", type=int, default=600)
@@ -86,8 +89,6 @@ def main():
     args = ap.parse_args()
 
     real, bounds = args.sink == "viam", floats(args.bounds)
-    if real and args.grip_width_mm is None:
-        raise SystemExit("give --grip-width-mm (the object's width in mm) before a real run: the gripper closes to that opening.")
     stop_cm = args.rotate_cm if args.wrist_flat else args.stop_cm       # where the tracking stops
     lo, hi = np.array(bounds[0::2], float), np.array(bounds[1::2], float)
     floor = table_floor_z(args.table_z_mm, args.tool_length_mm, args.table_margin_mm)
@@ -153,6 +154,8 @@ def main():
             return None, None, None
         view["frame"] = frame
         cands = object_candidates(detect(model, frame, dargs), args.object)
+        if not lock.locked:                              # choose the NEAREST one first (biggest on screen), then stay on it
+            cands = sorted(cands, key=lambda c: -(c[2] - c[0]) * (c[3] - c[1]))
         view["cands"] = cands
         lock.update(cands, frame.shape[1])
         if not lock.locked:
@@ -204,6 +207,29 @@ def main():
             raise SystemExit("probe rejected: " + problem + ". The arm is back at its start.")
         return J
 
+    def estimate_width():
+        """Median of a few pinhole width readings of the locked object (box width x depth / focal length), mm; or None."""
+        got = []
+        for _ in range(7):
+            frame = robot.get_frame(args.camera)
+            if frame is not None:
+                lock.update(object_candidates(detect(model, frame, dargs), args.object), frame.shape[1])
+            depth = None
+            for im in robot._run(robot._cams[args.camera].get_images())[0]:
+                if "dep" in str(im.mime_type).lower() and im.data[:8] == b"DEPTHMAP":
+                    dw, dh = struct.unpack(">QQ", im.data[8:24])
+                    depth = np.frombuffer(im.data[24:24 + dw * dh * 2], ">u2").reshape(dh, dw).astype(float)
+            if depth is None or frame is None or not lock.locked:
+                continue
+            h, w = frame.shape[:2]
+            d = box_depth_mm(cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST), tuple(lock.box))
+            fx = (rng.focal_px * w / rng.focal_w) if rng.focal_px else w / (2 * np.tan(np.radians(args.hfov) / 2))
+            wmm = width_from_depth(tuple(lock.box), d, fx) if d else None
+            if wmm:
+                got.append(wmm)
+            time.sleep(0.1)
+        return float(np.median(got)) if len(got) >= 3 else None
+
     def wrist_flat():
         """Rotate ONLY the wrist pitch joint (not the final roll joint) in 10-degree steps until the gripper is flat.
         Tool direction (o_x, o_y, o_z): o_z = -1 is pointing straight down, 0 is flat, o_x > 0 is pointing forward.
@@ -250,6 +276,14 @@ def main():
         return True
 
     def grasp():
+        gw = args.grip_width_mm or estimate_width()
+        if gw is None or not 25.0 <= gw <= 80.0:
+            msg = f"Cannot size the grip: estimated width {gw if gw is None else format(gw, '.0f') + ' mm'} (need 25-80 mm). Not closing; pass --grip-width-mm."
+            print(msg, flush=True)
+            if ui:
+                ui.say(msg)
+            return
+        print(f"grip opening {gw:.0f} mm" + (" (estimated from depth)" if not args.grip_width_mm else ""), flush=True)
         if args.wrist_flat:
             if not confirm(f"Arrived at {stop_cm:.0f} cm. ROTATE joint {args.wrist_joint} ONLY (up to {args.wrist_deg:.0f} "
                            "degrees, in 10-degree steps) to make the gripper flat. Keep the area around the arm clear."):
@@ -258,16 +292,16 @@ def main():
                 return
             advance_mm = max(args.rotate_cm - args.close_cm, 0.0) * 10.0
             if not confirm(f"ADVANCE {advance_mm:.0f} mm along the gripper axis (camera {args.rotate_cm:.0f} -> {args.close_cm:.0f} cm "
-                           f"from the cup), then CLOSE the gripper (to a {args.grip_width_mm:.0f} mm opening) and lift."):
+                           f"from the cup), then CLOSE the gripper (to a {gw:.0f} mm opening) and lift."):
                 return
             pn = robot.get_pose()
             robot._orient = None                         # hold the NEW (flat) orientation for the moves that follow
             goal = np.clip(advance_along(position(), (pn.o_x, pn.o_y, pn.o_z), advance_mm), lo, hi)
             robot.move_xyz(*goal, wait=True)
             time.sleep(0.5)
-        elif not confirm(f"Arrived at {stop_cm:.0f} cm. About to CLOSE the gripper (to a {args.grip_width_mm:.0f} mm opening) and lift."):
+        elif not confirm(f"Arrived at {stop_cm:.0f} cm. About to CLOSE the gripper (to a {gw:.0f} mm opening) and lift."):
             return
-        pos_cmd = robot.close_to_width(args.grip_width_mm, speed=args.grip_speed)   # position, not force
+        pos_cmd = robot.close_to_width(gw, speed=args.grip_speed)   # position, not force
         time.sleep(2.0)
         print(f"gripper commanded to {pos_cmd:.0f}, now {robot.gripper_command({'get': True})}", flush=True)
         pos = position()
