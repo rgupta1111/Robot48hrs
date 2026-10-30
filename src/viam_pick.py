@@ -25,6 +25,7 @@ import asyncio
 import os
 import sys
 import time
+import webbrowser
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cv2  # noqa: E402
@@ -38,6 +39,7 @@ from viam.rpc.dial import DialOptions  # noqa: E402
 from viam.services.motion import MotionClient  # noqa: E402
 
 from local_detect import Lock, detect, load_detector, object_candidates  # noqa: E402
+from mimic.ui import UIServer  # noqa: E402
 from mimic.size import box_depth_mm, height_from_depth, parse_viam_depth, width_from_depth  # noqa: E402
 
 
@@ -111,6 +113,7 @@ class Perceiver:
 
     def __init__(self, robot, camera_name, gripper_name, cam, intr, model, dargs, label, person_mm, aim_frac=0.5, memory=None):
         self.memory = memory
+        self.color, self.cands = None, []
         self.aim_frac = aim_frac     # where along the object's height to aim: 0.5 = its middle, 0.85 = near the top (the neck of a bottle)
         self.robot, self.camera_name, self.gripper_name, self.cam, self.intr = robot, camera_name, gripper_name, cam, intr
         self.model, self.dargs, self.label, self.person_mm = model, dargs, label, person_mm
@@ -150,6 +153,7 @@ class Perceiver:
                 pd = box_depth_mm(dmap, d[:4])
                 person_close = person_close or bool(pd and pd < self.person_mm)
         cands = object_candidates(dets, self.label)
+        self.color, self.cands = color, list(cands)           # for the web page's live view
         if not self.lock.locked:                         # (re)lock: the one nearest where it was; the first time, the nearest by depth
             scored = []
             for c in cands:
@@ -232,8 +236,104 @@ async def main_async(args):
         if args.near_world:
             eye.expected = np.array([float(v) for v in args.near_world.split(",")])
 
-        def confirm(q):
-            return args.yes or input(f"{q} Type 'yes' to continue: ").strip().lower() == "yes"
+        # ---------------- optional web page (--ui): live view, status, chat commands, STOP ----------------
+        loop = asyncio.get_running_loop()
+        flags = {"stop": False, "paused": False, "yes": None, "go": not args.ui}
+        view = {"text": "starting", "state": "starting", "dist": None}
+        ui = None
+
+        def say(msg, **_):
+            print(msg, flush=True)
+            if ui:
+                ui.say(msg)
+
+        def show(state, text, dist=None):
+            """Status text + the live camera frame with every detection (grey) and the locked one (green)."""
+            view["state"], view["text"], view["dist"] = state, text, dist
+            if not ui or eye.color is None:
+                return
+            img = eye.color.copy()
+            for c in eye.cands:
+                cv2.rectangle(img, (int(c[0]), int(c[1])), (int(c[2]), int(c[3])), (160, 160, 160), 1)
+            if eye.lock.locked:
+                b = [int(v) for v in eye.lock.box]
+                cv2.rectangle(img, (b[0], b[1]), (b[2], b[3]), (0, 200, 0), 3)
+            for k, line in enumerate((("LIVE ARM" if real else "DRY RUN - nothing moves") + f"  |  {state}", text[:64])):
+                cv2.putText(img, line, (12, 26 + 26 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 4)
+                cv2.putText(img, line, (12, 26 + 26 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
+            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if ok:
+                ui.set_frame(buf.tobytes())
+
+        def check_stop():
+            if flags["stop"]:
+                raise SystemExit("stopped from the page")
+
+        async def confirm(q):
+            """Typed in the terminal, or answered 'yes' / 'no' in the page's chat."""
+            if args.yes:
+                return True
+            if ui:
+                flags["yes"] = None
+                say(q + " Reply 'yes' to continue or 'no' to cancel.")
+                t0 = time.monotonic()
+                while flags["yes"] is None and not flags["stop"] and time.monotonic() - t0 < 120:
+                    await asyncio.sleep(0.2)
+                return bool(flags["yes"])
+            return (await asyncio.to_thread(input, f"{q} Type 'yes' to continue: ")).strip().lower() == "yes"
+
+        if args.ui:
+            names = {str(n).lower() for n in (model.names.values() if hasattr(model, "names") else [])}
+
+            def on_text(text):
+                t = text.lower().strip()
+                if "stop" in t:
+                    flags["stop"] = True
+                    if real:
+                        asyncio.run_coroutine_threadsafe(arm.stop(), loop)
+                    return "Stopped. Nothing else will move."
+                if t in ("yes", "y", "confirm", "ok", "go ahead"):
+                    flags["yes"] = True
+                    return "OK."
+                if t in ("no", "n", "cancel"):
+                    flags["yes"] = False
+                    return "Cancelled."
+                if "pause" in t:
+                    flags["paused"] = True
+                    return "Paused."
+                if "resume" in t or "continue" in t:
+                    flags["paused"] = False
+                    return "Resumed."
+                if any(w in t for w in ("pick", "grab", "get", "fetch", "go to", "bring")):
+                    if flags["go"]:
+                        return "Already on it."
+                    word = next((n for n in sorted(names, key=len, reverse=True) if n in t), None)   # "pick up the cup" -> cup
+                    if word and word != eye.label:
+                        eye.label = word
+                        eye.reset()
+                        eye.expected, eye.widths, eye.heights = None, [], []
+                        memory.label, memory.world, memory.first_world, memory.width, memory.height = word, None, None, None, None
+                    flags["go"] = True
+                    return f"Going to get the {eye.label}: sweep, approach, flatten, advance, grasp, lift." if real else \
+                        f"DRY RUN: looking for the {eye.label}; nothing will move."
+                if "see" in t or "status" in t:
+                    return view["text"]
+                return "I understand: pick up the <object>, stop, pause, resume, yes / no, what do you see."
+
+            ui = UIServer(on_text, lambda: {"mode": "LIVE ARM" if real else "DRY RUN", "state": view["state"], "target": eye.label,
+                                            "distance": None if view["dist"] is None else f"{view['dist']:.0f} cm"}, args.port).start()
+            print("UI:", ui.url, flush=True)
+            if not args.no_browser:
+                webbrowser.open(ui.url)
+            while not flags["go"] and not flags["stop"]:            # watch the scene until told to go
+                try:
+                    await eye.look()
+                except Exception:
+                    pass
+                seen_ = f"{len(eye.cands)} {eye.label}(s) in view" if eye.cands else f"no {eye.label} in view"
+                show("waiting", seen_ + " - say 'pick up the " + eye.label + "'")
+                await asyncio.sleep(0.15)
+            check_stop()
 
         async def gripper_pose():
             return (await robot.transform_pose(PoseInFrame(reference_frame=args.gripper, pose=Pose()), "world")).pose
@@ -284,6 +384,7 @@ async def main_async(args):
             await check_j6()
 
         async def go_rel(v, touch_ok=False, obstacle_rel=None):
+            check_stop()
             """Plan a move of v (mm, gripper frame) from where the gripper is now, keeping its orientation. The remembered object is
             an obstacle for the planner, except for the final advance (touch_ok), where the fingers must straddle it: then it is
             left out (a named collision exception failed: the planner did not know the obstacle by that name)."""
@@ -297,22 +398,29 @@ async def main_async(args):
         async def next_target(prev, misses):
             """look; wait while a person is close; returns (target, misses)."""
             while True:
+                check_stop()
+                while flags["paused"] and not flags["stop"]:
+                    await asyncio.sleep(0.2)
                 t = await eye.look()
                 if t and t["person_close"]:
-                    print("a person is close to the camera/gripper: waiting", flush=True)
+                    show("paused", "a person is close: waiting")
+                    say("a person is close to the camera/gripper: waiting", flush=True)
                     await asyncio.sleep(1.0)
                     continue
+                show("tracking" if t and t["seen"] else "searching",
+                     f"{eye.label}: {t['depth_mm'] / 10:.0f} cm, ~{t['width_mm']:.0f} mm wide" if t and t["seen"] else f"no {eye.label} in view",
+                     t["depth_mm"] / 10 if t and t["seen"] else None)
                 break
             if not t or not t["seen"]:
                 return None, misses + 1
             if prev is not None and np.linalg.norm(t["world"] - prev) > args.jump_mm:
-                print(f"  the object moved {np.linalg.norm(t['world'] - prev):.0f} mm: re-targeting", flush=True)
+                say(f"  the object moved {np.linalg.norm(t['world'] - prev):.0f} mm: re-targeting", flush=True)
             return t, 0
 
         async def reacquire(known):
             """Lost it. It has probably not gone anywhere, it just left the picture: back off along the camera axis, then sweep
             the base joint a few degrees each way, looking after every move. Returns a fresh target, or None."""
-            print("lost the object: searching nearby ...", flush=True)
+            say("lost the object: searching nearby ...", flush=True)
             gp = await gripper_pose()
             gpos, axis = np.array([gp.x, gp.y, gp.z]), unit([gp.o_x, gp.o_y, gp.o_z])
             for retreat in (80.0, 160.0):
@@ -321,7 +429,7 @@ async def main_async(args):
                 for _ in range(3):
                     t, _ = await next_target(None, 0)
                     if t:
-                        print(f"  found it again after backing off {retreat:.0f} mm", flush=True)
+                        say(f"  found it again after backing off {retreat:.0f} mm", flush=True)
                         return t
                     await asyncio.sleep(0.2)
             t = await wrist_scan()
@@ -336,7 +444,7 @@ async def main_async(args):
                 for _ in range(3):
                     t, _ = await next_target(None, 0)
                     if t:
-                        print(f"  found it again after turning the base {d:+.0f} deg", flush=True)
+                        say(f"  found it again after turning the base {d:+.0f} deg", flush=True)
                         return t
                     await asyncio.sleep(0.2)
             await arm.move_to_joint_positions(JointPositions(values=j_here))
@@ -346,7 +454,7 @@ async def main_async(args):
             """Look around by moving ONLY the two wrist joints (4 and 5), which pan/tilt the camera a little each way, looking after every
             pose. Returns a target (the arm stays where it saw it) or None (the wrist is put back where it was)."""
             j_here = list((await arm.get_joint_positions()).values)
-            print("  scanning with the wrist (joints 4 and 5) ...", flush=True)
+            say("  scanning with the wrist (joints 4 and 5) ...", flush=True)
             for d4, d5 in ((0, 10), (0, -10), (10, 0), (-10, 0), (10, 10), (10, -10), (-10, 10), (-10, -10),
                            (0, 20), (0, -20), (20, 0), (-20, 0)):
                 j = list(j_here)
@@ -357,7 +465,7 @@ async def main_async(args):
                 for _ in range(2):
                     t, _ = await next_target(None, 0)
                     if t:
-                        print(f"  found a {args.object} with the wrist at joint 4 {d4:+d}, joint 5 {d5:+d} deg", flush=True)
+                        say(f"  found a {args.object} with the wrist at joint 4 {d4:+d}, joint 5 {d5:+d} deg", flush=True)
                         return t
                     await asyncio.sleep(0.15)
             await arm.move_to_joint_positions(JointPositions(values=j_here))
@@ -378,7 +486,7 @@ async def main_async(args):
                     await arm.move_to_joint_positions(JointPositions(values=j0))
                     gain = abs(p0.o_z) - abs(p1.o_z)              # how much more level it got
                     results.append((gain, p1.o_x > p0.o_x, jn, sg))
-                    print(f"  test: joint {jn} {sg * 10:+.0f} deg -> levels by {gain:+.2f}" + (", pointing more forward" if p1.o_x > p0.o_x else ""), flush=True)
+                    say(f"  test: joint {jn} {sg * 10:+.0f} deg -> levels by {gain:+.2f}" + (", pointing more forward" if p1.o_x > p0.o_x else ""), flush=True)
             good = [r for r in results if r[0] > 0.02]
             if not good:
                 raise SystemExit(f"neither joint {' nor '.join(str(c) for c in candidates)} levels the gripper from here; not rotating")
@@ -392,17 +500,16 @@ async def main_async(args):
                 if abs((await gripper_pose()).o_z) < 0.05:
                     break
             gp = await gripper_pose()
-            print(f"joint {jn} rotated {sign * total:+.0f} deg; gripper axis ({gp.o_x:+.2f}, {gp.o_y:+.2f}, {gp.o_z:+.2f})", flush=True)
+            say(f"joint {jn} rotated {sign * total:+.0f} deg; gripper axis ({gp.o_x:+.2f}, {gp.o_y:+.2f}, {gp.o_z:+.2f})", flush=True)
 
         async def survey():
             """Nothing in view at the start and no remembered position: look around. Sweep the base in --survey-step-deg steps out to
             +/- --survey-deg, looking after each move; stop at the first object seen (nearest by depth in that view)."""
-            print("no bottle in view: looking around ...", flush=True)
-            if abs((await gripper_pose()).o_z) >= 0.08:        # exploring is easier with the gripper level: use the two flattening joints
-                try:
-                    await flatten()
-                except SystemExit as e:
-                    print(f"  (could not level the gripper for the survey: {e})", flush=True)
+            say("no bottle in view: looking around ...", flush=True)
+            try:                                               # exploring is done with the gripper pointing straight down
+                await orient_down()
+            except SystemExit as e:
+                say(f"  (could not point the gripper down for the survey: {e})", flush=True)
             t = await wrist_scan()
             if t:
                 return t
@@ -417,17 +524,51 @@ async def main_async(args):
                 for _ in range(3):
                     t, _ = await next_target(None, 0)
                     if t:
-                        print(f"  found a {args.object} after turning the base {d:+.0f} deg", flush=True)
+                        say(f"  found a {args.object} after turning the base {d:+.0f} deg", flush=True)
                         return t
                     await asyncio.sleep(0.2)
             await arm.move_to_joint_positions(JointPositions(values=j_here))
             return None
 
+        async def orient_down():
+            """Point the gripper straight DOWN (tool direction o_z -> -1) with ONE of the wrist joints (4 or 5, whichever points it further
+            down; never 6), so the camera looks at the table below during the survey. The later flatten stage levels it for the grasp."""
+            p0 = await gripper_pose()
+            if p0.o_z < -0.95:
+                return
+            j0 = list((await arm.get_joint_positions()).values)
+            results = []
+            for jn in (4, 5):
+                for sg in (1, -1):
+                    t = list(j0)
+                    t[jn - 1] += sg * 10.0                        # 10-degree test move, then straight back
+                    await arm.move_to_joint_positions(JointPositions(values=t))
+                    p1 = await gripper_pose()
+                    await arm.move_to_joint_positions(JointPositions(values=j0))
+                    results.append((abs(p1.o_z) - abs(p0.o_z), jn, sg))      # how much MORE vertical it got
+                    say(f"  test: joint {jn} {sg * 10:+.0f} deg -> {abs(p1.o_z) - abs(p0.o_z):+.2f} more vertical")
+            good = [r for r in results if r[0] > 0.02]
+            if not good:
+                say("  neither joint 4 nor 5 points the gripper further down from here; sweeping as it is")
+                return
+            _, jn, sg = max(good)
+            total = 0.0
+            while total < 100.0:
+                total += 10.0
+                t = list(j0)
+                t[jn - 1] += sg * total
+                await arm.move_to_joint_positions(JointPositions(values=t))
+                if (await gripper_pose()).o_z < -0.97:
+                    break
+            gp = await gripper_pose()
+            say(f"gripper pointed down with joint {jn} ({sg * total:+.0f} deg): axis ({gp.o_x:+.2f}, {gp.o_y:+.2f}, {gp.o_z:+.2f})")
+
         async def sweep_survey():
             """ALWAYS run first in a real run: world positions change between runs, so nothing remembered is trusted. Sweep the base from the
             starting pose in --survey-step-deg steps out to +/- --survey-deg, record the nearest object at each stop, then go back to the
             stop where the nearest one was seen and lock on it. The memory is reset to that object."""
-            print("initial sweep: looking around from the starting pose (object positions change, so always sweep first) ...", flush=True)
+            say("initial sweep: looking around from the starting pose (object positions change, so always sweep first) ...", flush=True)
+            await orient_down()                                   # the sweep is done with the gripper pointing straight down
             j_here = list((await arm.get_joint_positions()).values)
             offsets = [0.0] + [a * sg for a in np.arange(args.survey_step_deg, args.survey_deg + 1e-6, args.survey_step_deg) for sg in (1.0, -1.0)]
             seen = []
@@ -445,15 +586,15 @@ async def main_async(args):
                     await asyncio.sleep(0.15)
                 if best:
                     reach = float(np.hypot(*best["world"][:2]))
-                    print(f"  base {d:+.0f} deg: {args.object} {best['depth_mm'] / 10:.0f} cm from the camera (~{reach:.0f} mm from the base)", flush=True)
+                    say(f"  base {d:+.0f} deg: {args.object} {best['depth_mm'] / 10:.0f} cm from the camera (~{reach:.0f} mm from the base)", flush=True)
                     if reach <= 1000:
                         seen.append((best["depth_mm"], d))
             if not seen:
                 await arm.move_to_joint_positions(JointPositions(values=j_here))
-                print("  the sweep saw nothing within reach", flush=True)
+                say("  the sweep saw nothing within reach", flush=True)
                 return None
             _, d = min(seen)
-            print(f"  nearest: seen at base {d:+.0f} deg; going back there", flush=True)
+            say(f"  nearest: seen at base {d:+.0f} deg; going back there", flush=True)
             j = list(j_here)
             j[0] += d
             await arm.move_to_joint_positions(JointPositions(values=j))
@@ -476,7 +617,7 @@ async def main_async(args):
                 t = await (reacquire(known) if known is not None else survey())
                 if t:
                     return t
-                print(f"not found on search pass {attempt}: returning to the original pose and looking again", flush=True)
+                say(f"not found on search pass {attempt}: returning to the original pose and looking again", flush=True)
                 await arm.move_to_joint_positions(JointPositions(values=home))
                 eye.lock.unlock()
                 if known is None:
@@ -484,7 +625,7 @@ async def main_async(args):
                 for _ in range(3):
                     t, _ = await next_target(None, 0)
                     if t:
-                        print("  found it from the original pose", flush=True)
+                        say("  found it from the original pose", flush=True)
                         return t
                     await asyncio.sleep(0.3)
             return None
@@ -497,13 +638,13 @@ async def main_async(args):
             gpos = np.array([gp.x, gp.y, gp.z])
             if tgt:
                 vec = tgt["world"] - gpos
-                print(f"[look {i + 1}] {args.object} at world x{tgt['world'][0]:.0f} y{tgt['world'][1]:.0f} z{tgt['world'][2]:.0f} mm, "
+                say(f"[look {i + 1}] {args.object} at world x{tgt['world'][0]:.0f} y{tgt['world'][1]:.0f} z{tgt['world'][2]:.0f} mm, "
                       f"{tgt['depth_mm'] / 10:.0f} cm from the camera, ~{tgt['width_mm']:.0f} wide x {tgt['height_mm']:.0f} tall mm; "
                       f"{np.linalg.norm(vec) / 10:.0f} cm from the gripper; next waypoint "
                       f"{np.round(gpos + unit(vec) * min(np.linalg.norm(vec) - args.standoff_mm, args.step_mm))}", flush=True)
                 prev = tgt["world"]
             else:
-                print(f"[look {i + 1}] no {args.object} seen", flush=True)
+                say(f"[look {i + 1}] no {args.object} seen", flush=True)
             await asyncio.sleep(0.5)
         hold = args.hold_mm if args.hold_mm is not None else args.tip_ahead_mm / 2.0
         not_in_view = tgt is None
@@ -512,20 +653,21 @@ async def main_async(args):
             raise SystemExit(f"no {args.object} with a depth reading in view (a real run would look around: sweep the base +/-{args.survey_deg:.0f} deg)")
         if known0 is not None:
             reach = float(np.hypot(*known0[:2]))
-            print(f"the object is {reach:.0f} mm from the base axis (arm reach ~850 mm); width estimate {eye.width_estimate()} mm", flush=True)
+            say(f"the object is {reach:.0f} mm from the base axis (arm reach ~850 mm); width estimate {eye.width_estimate()} mm", flush=True)
             if reach > 1000:
                 if not real:
                     raise SystemExit(f"{reach:.0f} mm from the base axis: far beyond the arm's reach")
-                print(f"the first sighting is {reach:.0f} mm out, beyond reach: the sweep will look for a nearer one", flush=True)
+                say(f"the first sighting is {reach:.0f} mm out, beyond reach: the sweep will look for a nearer one", flush=True)
             if reach > args.max_reach_mm:
-                print(f"warning: the world estimate ({reach:.0f} mm) is past {args.max_reach_mm:.0f} mm, but it shifts ~10 cm with the viewpoint; "
+                say(f"warning: the world estimate ({reach:.0f} mm) is past {args.max_reach_mm:.0f} mm, but it shifts ~10 cm with the viewpoint; "
                       "the approach is measured in the gripper frame and the motion planner refuses anything truly unreachable", flush=True)
         if not real:
-            print("DRY RUN: nothing moved.")
+            say("DRY RUN: nothing moved.")
             return
-        if not confirm(f"The arm WILL first SWEEP the base left and right (up to {args.survey_deg:.0f} degrees) to find the nearest {args.object}, "
+        if not args.ui and not await confirm(f"The arm WILL first SWEEP the base left and right (up to {args.survey_deg:.0f} degrees) to find the nearest {args.object}, "
                        "then make planned moves toward it, re-planning every step. E-stop in reach?"):
             return
+        show("sweeping", "sweeping the base to find the nearest " + eye.label)
         tgt = await sweep_survey()                                # ALWAYS: positions change between runs
         if not tgt:                                               # nothing within reach from the sweep: level the gripper, wrist scan,
             tgt = await find_again(None)                          # wider base sweep, back to the original pose, once more
@@ -533,6 +675,7 @@ async def main_async(args):
                 raise SystemExit("could not find a " + args.object + " by looking around; stopping")
 
         # ---- stage A: approach the pre-grasp pose in short re-planned steps ----
+        show("approaching", "approaching the pre-grasp pose")
         await gripper.do_command({"set": 840.0})
         j6_start = (await arm.get_joint_positions()).values[5]
         j6_ref["v"] = j6_start
@@ -549,30 +692,31 @@ async def main_async(args):
             rel = await rel_of(tgt, known)                 # object in the gripper frame (a stationary object: last known if out of view)
             pre_g = rel - unit(rel) * args.standoff_mm       # stop standoff_mm short of it, along the line to it
             if np.linalg.norm(pre_g) < args.tol_mm:
-                print("at the pre-grasp pose", flush=True)
+                say("at the pre-grasp pose", flush=True)
                 break
             await go_rel(unit(pre_g) * min(np.linalg.norm(pre_g), args.step_mm), obstacle_rel=rel)
-            print(f"[A {cycle}] {np.linalg.norm(pre_g):.0f} mm to the pre-grasp pose; object {rel[2]:.0f} mm ahead, {np.hypot(rel[0], rel[1]):.0f} mm off-axis"
+            say(f"[A {cycle}] {np.linalg.norm(pre_g):.0f} mm to the pre-grasp pose; object {rel[2]:.0f} mm ahead, {np.hypot(rel[0], rel[1]):.0f} mm off-axis"
                   + ("" if tgt else " (last known: out of view)"), flush=True)
         else:
             raise SystemExit("did not reach the pre-grasp pose within the cycle limit")
         d6 = (await arm.get_joint_positions()).values[5] - j6_start
-        print(f"joint 6 changed {d6:+.1f} deg during the approach", flush=True)
+        say(f"joint 6 changed {d6:+.1f} deg during the approach", flush=True)
         if abs(d6) > 90:
             raise SystemExit("joint 6 turned a long way; stopping here")
 
         # ---- stage B: flatten with ONE wrist joint (4 or 5, whichever flattens it from this pose; never 6) ----
         if abs((await gripper_pose()).o_z) < 0.08:
-            print("the gripper is already level: skipping the flatten stage", flush=True)
+            say("the gripper is already level: skipping the flatten stage", flush=True)
         else:
             candidates = [args.wrist_joint] if args.wrist_joint else [4, 5]
-            if not confirm(f"FLATTEN: rotate joint {' or '.join(str(c) for c in candidates)} only (whichever levels the gripper; never 6), "
+            if not await confirm(f"FLATTEN: rotate joint {' or '.join(str(c) for c in candidates)} only (whichever levels the gripper; never 6), "
                            f"in 10-degree steps up to {args.wrist_deg:.0f}."):
                 return
             await flatten()
 
         # ---- stage C: advance along the gripper axis, correcting sideways, still re-planning ----
-        if not confirm("ADVANCE along the gripper axis onto the object (re-planned every step), then CLOSE and lift."):
+        show("advancing", "aligning and advancing onto the object")
+        if not await confirm("ADVANCE along the gripper axis onto the object (re-planned every step), then CLOSE and lift."):
             return
         eye.reset()
         peek = {"used": 0.0}
@@ -594,7 +738,7 @@ async def main_async(args):
                 step = min(10.0, args.peek_down_mm - peek["used"])
                 await go_down(step)
                 peek["used"] += step
-                print(f"[C {cycle}] object out of view: lowered {step:.0f} mm ({peek['used']:.0f}/{args.peek_down_mm:.0f}) to look for it again", flush=True)
+                say(f"[C {cycle}] object out of view: lowered {step:.0f} mm ({peek['used']:.0f}/{args.peek_down_mm:.0f}) to look for it again", flush=True)
                 continue
             rel = await rel_of(t, last)                    # gripper frame; dead-reckons from the last known spot when out of view
             along, lat = float(rel[2]), float(np.hypot(rel[0], rel[1]))
@@ -604,14 +748,14 @@ async def main_async(args):
             if lat > args.align_tol_mm:                    # ALIGN FIRST: sideways/vertical only, and stay clear of the object
                 back = max(args.clearance_mm - along, 0.0)
                 await go_rel(np.array([cap(rel[0]), cap(rel[1]), -back]), obstacle_rel=rel)
-                print(f"[C {cycle}] aligning: {lat:.0f} mm off-axis, {along:.0f} mm ahead" + (f", backing off {back:.0f} mm" if back else "")
+                say(f"[C {cycle}] aligning: {lat:.0f} mm off-axis, {along:.0f} mm ahead" + (f", backing off {back:.0f} mm" if back else "")
                       + ("" if t else " (out of view)"), flush=True)
                 continue
             if along <= hold + args.grasp_tol_mm:
                 break
             adv = min(args.step_mm, along - hold)
             await go_rel(np.array([cap(rel[0]), cap(rel[1]), adv]), touch_ok=along <= args.clearance_mm + args.step_mm, obstacle_rel=rel)
-            print(f"[C {cycle}] {along:.0f} mm along the axis, {lat:.0f} mm off to the side" + ("" if t else " (out of view)"), flush=True)
+            say(f"[C {cycle}] {along:.0f} mm along the axis, {lat:.0f} mm off to the side" + ("" if t else " (out of view)"), flush=True)
         else:
             raise SystemExit("did not reach the object within the cycle limit")
         # ---- re-check before closing: a person may have moved it ----
@@ -621,21 +765,23 @@ async def main_async(args):
         if t:
             rel = t["rel_mm"]
             along, lat = float(rel[2]), float(np.hypot(rel[0], rel[1]))
-            print(f"final check: {along:.0f} mm along, {lat:.0f} mm to the side", flush=True)
+            say(f"final check: {along:.0f} mm along, {lat:.0f} mm to the side", flush=True)
             if lat > args.lat_tol_mm or along > hold + 45:
                 raise SystemExit("the object is no longer lined up with the gripper (moved?): not closing")
         width = args.grip_width_mm or (None if eye.width_estimate() is None else eye.width_estimate() + args.grip_trim_mm)
         if width is None or not 25.0 <= width <= 80.0:
             raise SystemExit(f"cannot size the grip (estimated width {width}); pass --grip-width-mm. Not closing.")
-        if not confirm(f"CLOSE the gripper to {width:.0f} mm (position {width * 10:.0f}, no force) and lift {args.lift_mm:.0f} mm."):
+        if not await confirm(f"CLOSE the gripper to {width:.0f} mm (position {width * 10:.0f}, no force) and lift {args.lift_mm:.0f} mm."):
             return
         await gripper.do_command({"set_gripper_speed": 300})
         await gripper.do_command({"set": float(width * 10)})
         await asyncio.sleep(2.5)
-        print("gripper position:", await gripper.do_command({"get": True}), flush=True)
+        say("gripper position:", await gripper.do_command({"get": True}), flush=True)
         gp = await gripper_pose()
         await go(np.array([gp.x, gp.y, gp.z + args.lift_mm]), gp)
-        print("lifted.", flush=True)
+        say("lifted.")
+        show("done", "lifted")
+        await asyncio.sleep(2.0)
     finally:
         try:
             memory.save()
@@ -660,6 +806,10 @@ def main():
     ap.add_argument("--memory-file", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "object_memory.json"),
                     help="where the object's remembered position and size are saved")
     ap.add_argument("--use-memory", action="store_true", help="start from the remembered object position/size in --memory-file (it may be stale)")
+    ap.add_argument("--ui", action="store_true", help="serve the local web page: live camera view, status, chat ('pick up the cup'), STOP; "
+                    "yes/no in the chat answer the confirmations")
+    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--no-browser", action="store_true", help="with --ui: do not open the page automatically")
     ap.add_argument("--survey-deg", type=float, default=20.0, help="initial look-around: sweep the base out to +/- this many degrees")
     ap.add_argument("--survey-step-deg", type=float, default=10.0, help="initial look-around: base step between looks")
     ap.add_argument("--near-world", help="x,y,z (mm, world): start with the object nearest this point (to pick a particular one)")
@@ -691,7 +841,7 @@ def main():
                     "sits slightly outside the object, so the estimate reads wide (79 mm closed 1-2 mm too loose on the bottle). Negative = tighter")
     ap.add_argument("--wrist-joint", type=int, default=0, help="joint that flattens the gripper (Viam app numbering); 0 = try 4 and 5 and pick "
                     "the one that works from the current pose (never 6)")
-    ap.add_argument("--wrist-deg", type=float, default=90.0)
+    ap.add_argument("--wrist-deg", type=float, default=100.0)
     ap.add_argument("--peek-down-mm", type=float, default=20.0, help="when the object is out of view in the final stage, lower the gripper "
                     "in 10 mm steps by up to this much and look again (a level gripper looks straight ahead, over the object)")
     ap.add_argument("--max-j6-deg", type=float, default=0.0, help="stop if joint 6 (final roll) turns more than this from where the run began (0 = no limit)")
