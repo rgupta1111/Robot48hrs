@@ -36,6 +36,7 @@ from viam.components.gripper import Gripper  # noqa: E402
 from viam.proto.common import Geometry, GeometriesInFrame, Pose, PoseInFrame, RectangularPrism, Vector3, WorldState  # noqa: E402
 from viam.robot.client import RobotClient  # noqa: E402
 from viam.rpc.dial import DialOptions  # noqa: E402
+from viam.proto.service.motion import CollisionSpecification, Constraints  # noqa: E402
 from viam.services.motion import MotionClient  # noqa: E402
 
 from local_detect import Lock, detect, load_detector, object_candidates  # noqa: E402
@@ -471,14 +472,25 @@ async def main_async(args):
         async def go_rel(v, touch_ok=False, obstacle_rel=None):
             check_stop()
             """Plan a move of v (mm, gripper frame) from where the gripper is now, keeping its orientation. The remembered object is
-            an obstacle for the planner, except for the final advance (touch_ok), where the fingers must straddle it: then it is
-            left out (a named collision exception failed: the planner did not know the obstacle by that name)."""
+            an obstacle for the planner. For the final advance (touch_ok) the fingers must straddle it, so the obstacle stays in the
+            world but the planner is told the claws may touch it (planner geometry names: 'gripper:claws' and the obstacle's label);
+            if the planner rejects that, the obstacle is left out for this step."""
             p = (await robot.transform_pose(PoseInFrame(reference_frame=args.gripper, pose=Pose(x=float(v[0]), y=float(v[1]), z=float(v[2]))),
                                             "world")).pose
+            goal = PoseInFrame(reference_frame="world", pose=Pose(x=p.x, y=p.y, z=max(p.z, args.min_z_mm), o_x=p.o_x, o_y=p.o_y, o_z=p.o_z, theta=p.theta))
+            ws = await object_obstacle(obstacle_rel)
+            allow = None
+            if touch_ok and ws is not None:
+                allow = Constraints(collision_specification=[CollisionSpecification(allows=[
+                    CollisionSpecification.AllowedFrameCollisions(frame1="gripper:claws", frame2=args.object)])])
             try:
-                await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=Pose(
-                    x=p.x, y=p.y, z=max(p.z, args.min_z_mm), o_x=p.o_x, o_y=p.o_y, o_z=p.o_z, theta=p.theta)),
-                    world_state=None if touch_ok else await object_obstacle(obstacle_rel))
+                try:
+                    await motion.move(args.gripper, goal, world_state=ws, constraints=allow)
+                except Exception as e:
+                    if allow is None or not ("collision" in str(e).lower() or "frame" in str(e).lower() or "name" in str(e).lower()):
+                        raise
+                    say("  the planner did not accept the claws/object exception: this step goes without the obstacle", flush=True)
+                    await motion.move(args.gripper, goal, world_state=None)
             except Exception as e:
                 if "IK solution" in str(e) or "unreachable" in str(e) or "obstacle constraint" in str(e):
                     say("  that step is not reachable / blocked: skipping it", flush=True)
@@ -665,32 +677,50 @@ async def main_async(args):
                 say(f"no person seen: I will hold it out at x{spot[0]:.0f} y{spot[1]:.0f} z{spot[2]:.0f}")
             if not await confirm(f"HAND OVER: move the {eye.label} to x{spot[0]:.0f} y{spot[1]:.0f} z{spot[2]:.0f} and hold it out for you to take."):
                 return
-            gp = await gripper_pose()
-            await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=at(spot, gp)))
-            await check_j6()
-            show("handover", "holding it out: take it, or say 'release'")
-            say(f"Holding the {eye.label} out. Take it: I let go when I feel a pull, or reply 'release' / 'yes'.")
-            await asyncio.sleep(2.0)                                   # let the arm settle, then read the baseline load
-            base = np.array((await arm.do_command({"load": ""})).get("load", [0.0] * 6), float)
-            flags["yes"] = None
-            t0 = time.monotonic()
-            while time.monotonic() - t0 < 90 and not flags["stop"]:
-                if flags["yes"]:
-                    say("released on your command")
-                    break
-                load = np.array((await arm.do_command({"load": ""})).get("load", [0.0] * 6), float)
-                if float(np.max(np.abs(load - base))) > args.pull_load:
-                    say("felt a pull: letting go")
-                    break
-                await asyncio.sleep(0.15)
-            else:
-                say("nobody took it within 90 s: still holding it; reply 'release' to let go")
-                return
-            await gripper.do_command({"set": 840.0})                    # open: it is theirs
-            await asyncio.sleep(1.5)
-            await go_rel(np.array([0.0, 0.0, -100.0]))                  # back away 10 cm along the gripper axis
-            say("handed over.")
-            show("done", "handed over")
+            async def speed(dps):
+                try:
+                    await arm.do_command({"set_speed": float(dps)})
+                except Exception:
+                    pass
+            await speed(args.handover_speed_dps)                        # slow near the person; restored below
+            try:
+                gp = await gripper_pose()
+                await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=at(spot, gp)))
+                await check_j6()
+                show("handover", "holding it out: take it, or say 'release'")
+                say(f"Holding the {eye.label} out. Take it: I let go when I feel a steady pull, or reply 'release' / 'yes'.")
+                await asyncio.sleep(2.0)                               # let the arm settle, then read the baseline load
+                base = np.array((await arm.do_command({"load": ""})).get("load", [0.0] * 6), float)
+                flags["yes"] = None
+                t0, since, taken = time.monotonic(), None, False
+                while time.monotonic() - t0 < args.handover_wait_s and not flags["stop"]:
+                    if flags["yes"]:
+                        say("released on your command")
+                        taken = True
+                        break
+                    load = np.array((await arm.do_command({"load": ""})).get("load", [0.0] * 6), float)
+                    if float(np.max(np.abs(load - base))) > args.pull_load:
+                        since = since or time.monotonic()               # a spike does not count: the pull must last
+                        if time.monotonic() - since >= args.pull_hold_s:
+                            say("felt a steady pull: letting go")
+                            taken = True
+                            break
+                    else:
+                        since = None
+                    await asyncio.sleep(0.05)
+                if not taken:
+                    say(f"nobody took it within {args.handover_wait_s:.0f} s: putting it back down")
+                    await go_rel(np.array([0.0, 0.0, 0.0]))
+                    gp = await gripper_pose()
+                    await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=at(np.array([gp.x, gp.y, max(args.table_top_mm + 120.0, args.min_z_mm)]), gp)))
+                    await asyncio.sleep(0.5)
+                await gripper.do_command({"set": 840.0})                # open: theirs (or back on the table)
+                await asyncio.sleep(args.handover_settle_s)             # let go fully before moving away
+                await go_rel(np.array([0.0, 0.0, -100.0]))              # back away 10 cm along the gripper axis
+            finally:
+                await speed(args.arm_speed_dps)
+            say("handed over." if taken else "put it back down.")
+            show("done", "handed over" if taken else "put down")
 
         async def set_roll():
             """Set the final roll joint (--roll-joint, app numbering; 6) to the taught pick value (--roll-target-deg, about -360), which is
@@ -1113,6 +1143,11 @@ def main():
                     "gripper, so it is left alone)")
     ap.add_argument("--no-sweep", action="store_true", help="skip the initial sweep: start from where the arm is (use with --use-memory when "
                     "the object is already close)")
+    ap.add_argument("--handover-speed-dps", type=float, default=15.0, help="arm speed (deg/s) while holding the object out to a person")
+    ap.add_argument("--arm-speed-dps", type=float, default=50.0, help="arm speed (deg/s) restored after the handover")
+    ap.add_argument("--handover-wait-s", type=float, default=60.0, help="how long to wait for the person to take it, then put it down")
+    ap.add_argument("--pull-hold-s", type=float, default=0.3, help="the pull must last this long before the gripper opens")
+    ap.add_argument("--handover-settle-s", type=float, default=0.8, help="pause after opening, before backing away")
     ap.add_argument("--no-handover", action="store_true", help="do not hand the object to a person after lifting it")
     ap.add_argument("--handover-xyz", default="500,0,350", help="where to hold it out when no person is seen (world mm)")
     ap.add_argument("--handover-gap-mm", type=float, default=450.0, help="stay this far short of the person")
