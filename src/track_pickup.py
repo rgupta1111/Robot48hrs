@@ -46,10 +46,13 @@ def main():
     ap.add_argument("--table-z-mm", type=float, default=-123.0, help="table top height in the robot frame (the lab preset's)")
     ap.add_argument("--tool-length-mm", type=float, default=105.0, help="flange-to-fingertip length of the gripper")
     ap.add_argument("--table-margin-mm", type=float, default=30.0, help="keep the fingertips at least this far above the table")
-    ap.add_argument("--horizontal", action="store_true", help="grab it from the side: first rotate the tool from pointing "
-                    "down to pointing horizontally forward (asks first), then track with that orientation held")
-    ap.add_argument("--roll-deg", type=float, default=0.0, help="--horizontal: twist about the tool axis (which way the fingers open)")
-    ap.add_argument("--half-gripper-mm", type=float, default=80.0, help="--horizontal: lowest extent of the gripper below its axis")
+    ap.add_argument("--wrist-flat", action="store_true", help="at the grip distance, rotate ONLY the wrist pitch joint "
+                    "(--wrist-joint) until the gripper is flat, then close it (asks before each step)")
+    ap.add_argument("--wrist-joint", type=int, default=5, help="--wrist-flat: which joint pitches the wrist, numbered as in the Viam app (1-6)")
+    ap.add_argument("--wrist-deg", type=float, default=90.0, help="--wrist-flat: most it may rotate, in 10-degree steps")
+    ap.add_argument("--wrist-sign", type=int, choices=[-1, 0, 1], default=0, help="--wrist-flat: which way (+1/-1); 0 = try both "
+                    "with a 10-degree test and pick the one that flattens the gripper and points it forward")
+    ap.add_argument("--flat-floor-mm", type=float, default=80.0, help="--wrist-flat: lowest extent of the gripper below its axis once flat")
     ap.add_argument("--stop-cm", type=float, default=10.0, help="close the gripper at this camera-to-object distance")
     ap.add_argument("--tip-offset-mm", type=float, default=0.0, help="the gripper sits this far below the camera")
     ap.add_argument("--tip-flip", action="store_true", help="the gripper is above the camera instead")
@@ -77,16 +80,10 @@ def main():
 
     real, bounds = args.sink == "viam", floats(args.bounds)
     lo, hi = np.array(bounds[0::2], float), np.array(bounds[1::2], float)
-    if args.horizontal:   # the gripper now lies along x: its lowest point is half its body below the tool axis
-        floor = table_floor_z(args.table_z_mm, args.half_gripper_mm, args.table_margin_mm)
-        lo[2] = floor                                  # replaces the preset's z min, which assumed a tool pointing down
-        print(f"table-safe floor (horizontal tool): the tool axis never goes below z = {floor:.0f} mm "
-              f"(table top {args.table_z_mm:.0f}, gripper {args.half_gripper_mm:.0f} mm below its axis, margin {args.table_margin_mm:.0f})")
-    else:
-        floor = table_floor_z(args.table_z_mm, args.tool_length_mm, args.table_margin_mm)
-        lo[2] = max(lo[2], floor)                      # never command a pose that puts the fingers into the table
-        print(f"table-safe floor: the tool never goes below z = {lo[2]:.0f} mm "
-              f"(table top {args.table_z_mm:.0f}, fingertips {args.tool_length_mm:.0f} mm below the tool, margin {args.table_margin_mm:.0f})")
+    floor = table_floor_z(args.table_z_mm, args.tool_length_mm, args.table_margin_mm)
+    lo[2] = max(lo[2], floor)                          # never command a pose that puts the fingers into the table
+    print(f"table-safe floor: the tool never goes below z = {lo[2]:.0f} mm "
+          f"(table top {args.table_z_mm:.0f}, fingertips {args.tool_length_mm:.0f} mm below the tool, margin {args.table_margin_mm:.0f})")
     model, dargs = load_detector(args.object)
     robot = ViamRobot(args.viam_address, args.arm_name, args.gripper_name, None, TableToWorld(),
                       workspace=bounds[:4], max_z_mm=bounds[5])
@@ -193,8 +190,60 @@ def main():
             raise SystemExit("probe rejected: " + problem + ". The arm is back at its start.")
         return J
 
+    def wrist_flat():
+        """Rotate ONLY the wrist pitch joint (not the final roll joint) in 10-degree steps until the gripper is flat.
+        Tool direction (o_x, o_y, o_z): o_z = -1 is pointing straight down, 0 is flat, o_x > 0 is pointing forward.
+        Stops early if the tool gets too low for a flat gripper over the table. Returns True when it is flat."""
+        wj = args.wrist_joint - 1
+        floor_h = table_floor_z(args.table_z_mm, args.flat_floor_mm, args.table_margin_mm)
+
+        def say(msg):
+            print(msg, flush=True)
+            if ui:
+                ui.say(msg)
+
+        if position()[2] < floor_h:
+            say(f"The tool is at z {position()[2]:.0f} mm, lower than {floor_h:.0f} mm: a flat gripper would hit the table. Not rotating.")
+            return False
+        j0, p0 = robot.get_joints()[wj], robot.get_pose()
+        sign = args.wrist_sign
+        if not sign:                                         # 10-degree test each way: which flattens it and points forward?
+            options = []
+            for sg in (1, -1):
+                robot.set_joint(wj, j0 + sg * 10.0)
+                p1 = robot.get_pose()
+                robot.set_joint(wj, j0)
+                if abs(p1.o_z) < abs(p0.o_z) - 0.02:
+                    options.append((sg, p1.o_x > p0.o_x))
+            if not options:
+                say(f"Joint {args.wrist_joint} does not flatten the gripper from this pose. Not rotating; use --wrist-sign / check the joint.")
+                return False
+            sign = next((sg for sg, forward in options if forward), options[0][0])
+        total = 0.0
+        while total < args.wrist_deg:
+            step = min(10.0, args.wrist_deg - total)
+            total += step
+            robot.set_joint(wj, j0 + sign * total)
+            p = robot.get_pose()
+            if position()[2] < floor_h:
+                say(f"Stopped at {total:.0f} degrees: the tool is too low for a flat gripper.")
+                return False
+            if abs(p.o_z) < 0.05:
+                break
+        p = robot.get_pose()
+        say(f"Joint {args.wrist_joint} rotated {sign * total:+.0f} degrees; the tool direction is now "
+            f"({p.o_x:+.2f}, {p.o_y:+.2f}, {p.o_z:+.2f}).")
+        return True
+
     def grasp():
-        if not confirm(f"Arrived at {args.stop_cm:.0f} cm. About to CLOSE the gripper (force cap {args.max_torque}%) and lift."):
+        if args.wrist_flat:
+            if not confirm(f"Arrived at {args.stop_cm:.0f} cm. ROTATE joint {args.wrist_joint} ONLY (up to {args.wrist_deg:.0f} "
+                           "degrees, in 10-degree steps) to make the gripper flat. Keep the area around the arm clear."):
+                return
+            if not wrist_flat():
+                return
+        if not confirm(f"{'' if args.wrist_flat else 'Arrived at ' + format(args.stop_cm, '.0f') + ' cm. '}"
+                       f"About to CLOSE the gripper (force cap {args.max_torque}%) and lift."):
             return
         try:   # UFactory G2 only; a G1 has no force setting, so the close is then unlimited
             robot.gripper_command({"set_gripper_torque": args.max_torque})
@@ -261,23 +310,11 @@ def main():
                 except Exception as e:
                     print(f"could not set the arm speed ({type(e).__name__}); using the configured speed")
             robot.set_gripper(True)
-            if args.horizontal:
-                p0 = position()
-                z0 = float(np.clip(p0[2], lo[2], hi[2]))
-                if not confirm(f"ROTATE the tool from pointing down to HORIZONTAL (forward), staying at x{p0[0]:.0f} y{p0[1]:.0f} "
-                               f"z{z0:.0f} mm. The wrist turns about 90 degrees; keep the area around the arm clear."):
-                    return
-                if ui:
-                    ui.say("Rotating the tool to horizontal ...")
-                robot.move_to(p0[0], p0[1], z0, args.roll_deg, 90.0)
-                robot._orient = None                    # later moves must hold the NEW orientation
-                time.sleep(0.8)
-                print("tool is horizontal; now at x{:.0f} y{:.0f} z{:.0f}".format(*position()), flush=True)
             J = probe()
         else:
             J = None
             print("DRY RUN: nothing will move; printing where the gripper would go"
-                  + ("; it would first rotate the tool to horizontal" if args.horizontal else ""))
+                  + ("; at the grip distance it would rotate the wrist joint flat" if args.wrist_flat else ""))
         target, prev, last_t, misses, errs = np.zeros(3), np.zeros(3), time.monotonic(), 0, []
         for cycle in range(1, args.max_cycles + 1):
             if flags["stop"]:
