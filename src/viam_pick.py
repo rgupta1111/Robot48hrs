@@ -262,6 +262,17 @@ async def main_async(args):
                          box=RectangularPrism(dims_mm=Vector3(x=memory.width + 30, y=memory.width + 30, z=memory.height + 30)), label=args.object)
             return WorldState(obstacles=[GeometriesInFrame(reference_frame="world", geometries=[g])])
 
+        j6_ref = {"v": None}
+
+        async def check_j6():
+            """Joint 6 (the final roll) must not wander: the planner holds the gripper's world orientation, so a long base swing can
+            make it spin. Stop if it has turned more than --max-j6-deg from where the run began."""
+            j6 = (await arm.get_joint_positions()).values[5]
+            if j6_ref["v"] is None:
+                j6_ref["v"] = j6
+            elif abs(j6 - j6_ref["v"]) > args.max_j6_deg:
+                raise SystemExit(f"joint 6 has turned {j6 - j6_ref['v']:+.0f} deg since the start (limit {args.max_j6_deg:.0f}): stopping")
+
         async def go_rel(v, touch_ok=False):
             """Plan a move of v (mm, gripper frame) from where the gripper is now, keeping its orientation. The remembered object is
             an obstacle, except for the final advance (touch_ok), where the fingers must be allowed to straddle it."""
@@ -272,6 +283,7 @@ async def main_async(args):
             await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=Pose(
                 x=p.x, y=p.y, z=max(p.z, args.min_z_mm), o_x=p.o_x, o_y=p.o_y, o_z=p.o_z, theta=p.theta)),
                 world_state=object_obstacle(), constraints=allow)
+            await check_j6()
 
         async def next_target(prev, misses):
             """look; wait while a person is close; returns (target, misses)."""
@@ -361,6 +373,7 @@ async def main_async(args):
         # ---- stage A: approach the pre-grasp pose in short re-planned steps ----
         await gripper.do_command({"set": 840.0})
         j6_start = (await arm.get_joint_positions()).values[5]
+        j6_ref["v"] = j6_start
         prev, misses, known = None, 0, tgt["world"]
         for cycle in range(1, args.max_cycles + 1):
             tgt, misses = await next_target(prev, misses)
@@ -480,6 +493,10 @@ async def main_async(args):
         await go(np.array([gp.x, gp.y, gp.z + args.lift_mm]), gp)
         print("lifted.", flush=True)
     finally:
+        try:
+            memory.save()
+        except Exception:
+            pass
         if real:
             try:
                 await arm.stop()
@@ -523,6 +540,7 @@ def main():
     ap.add_argument("--wrist-joint", type=int, default=0, help="joint that flattens the gripper (Viam app numbering); 0 = try 4 and 5 and pick "
                     "the one that works from the current pose (never 6)")
     ap.add_argument("--wrist-deg", type=float, default=90.0)
+    ap.add_argument("--max-j6-deg", type=float, default=45.0, help="stop if joint 6 (final roll) turns more than this from where the run began")
     ap.add_argument("--wrist-sign", type=int, choices=[-1, 0, 1], default=0)
     ap.add_argument("--lift-mm", type=float, default=120.0)
     ap.add_argument("--yes", action="store_true", help="skip the typed confirmations (not recommended)")
