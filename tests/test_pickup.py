@@ -73,6 +73,9 @@ def test_check_jacobian_rejects_the_bad_probe_from_the_real_run_and_accepts_a_go
     assert check_jacobian(bad) is not None
     assert check_jacobian(J) is None
     assert check_jacobian(np.zeros((3, 3))) is not None
+    # the probe that was wrongly rejected: x -> v strongly, y -> u 7x more weakly, but clearly different directions
+    ok = np.array([[-0.00042, 0.00077, 3e-05], [-0.0055, -0.00033, 0.0], [0.00083, 2e-05, 0.0]])
+    assert check_jacobian(ok) is None
 
 
 def test_aborts_when_the_image_error_keeps_growing():

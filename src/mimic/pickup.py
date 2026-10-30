@@ -47,14 +47,18 @@ def smooth_move(prev, move, blend=0.5, max_mm=None):
     return m * (max_mm / n) if max_mm is not None and n > max_mm else m
 
 
-def check_jacobian(J, min_response=1e-4, min_ratio=0.2):
+def check_jacobian(J, min_response=3e-4, max_cos=0.9):
     """Sanity-check a learned image response before servoing with it. -> an error message, or None when usable.
-    Moving the gripper in x and y must shift the object differently in the image: if the x and y columns point the
-    same way (or barely respond) the probe was dominated by noise or drift and servoing on it would drive off."""
-    sv = np.linalg.svd(np.asarray(J, float)[:2, :2], compute_uv=False)
-    if sv[0] < min_response:
-        return "the object barely moved in the image during the probe moves"
-    if sv[1] < min_ratio * sv[0]:
+    Moving the gripper in x and y must shift the object in clearly DIFFERENT image directions, and each axis must shift
+    it by more than noise (min_response, image fraction per mm; ~0.006 of the frame for a 20 mm probe). If both columns
+    point the same way the probe was dominated by drift or a stale frame and servoing on it would drive off.
+    A weak axis is fine as long as it is above the noise: the two axes need not respond equally."""
+    A = np.asarray(J, float)[:2, :2]
+    cx, cy = A[:, 0], A[:, 1]
+    nx, ny = np.linalg.norm(cx), np.linalg.norm(cy)
+    if min(nx, ny) < min_response:
+        return "the object barely moved in the image for one of the probe moves (" + ("x" if nx < ny else "y") + ")"
+    if abs(float(cx @ cy)) / (nx * ny) > max_cos:
         return "moving x and y shifted the object the same way (probe unreliable: drift or a stale frame)"
     return None
 
