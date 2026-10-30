@@ -32,9 +32,10 @@ import numpy as np  # noqa: E402
 from viam.components.arm import Arm, JointPositions  # noqa: E402
 from viam.components.camera import Camera  # noqa: E402
 from viam.components.gripper import Gripper  # noqa: E402
-from viam.proto.common import Pose, PoseInFrame  # noqa: E402
+from viam.proto.common import Geometry, GeometriesInFrame, Pose, PoseInFrame, RectangularPrism, Vector3, WorldState  # noqa: E402
 from viam.robot.client import RobotClient  # noqa: E402
 from viam.rpc.dial import DialOptions  # noqa: E402
+from viam.proto.service.motion import CollisionSpecification, Constraints  # noqa: E402
 from viam.services.motion import MotionClient  # noqa: E402
 
 from local_detect import Lock, detect, load_detector, object_candidates  # noqa: E402
@@ -56,10 +57,61 @@ async def connect(address):
     return await RobotClient.at_address(address, RobotClient.Options(dial_options=dial))
 
 
+class ObjectMemory:
+    """Everything known about the ORIGINAL object, kept for the whole run and saved to a file: where it is (world frame, weighted
+    toward the closest and so most reliable sightings; replaced outright if it is moved), how big it is, when it was last seen."""
+
+    def __init__(self, path, label, jump_mm=150.0):
+        self.path, self.label, self.jump_mm = path, label, jump_mm
+        self.world = self.first_world = None
+        self.weight, self.width, self.height, self.sightings, self.last_seen = 0.0, None, None, 0, None
+
+    def update(self, t, width=None, height=None):
+        """Fold in one sighting (a look() result)."""
+        w_new = 1.0 / max(t["depth_mm"], 100.0) ** 2         # closer sightings count for more
+        if self.world is None:
+            self.world, self.weight, self.first_world = t["world"].copy(), w_new, t["world"].copy()
+        elif np.linalg.norm(t["world"] - self.world) > self.jump_mm:   # it was moved (or the estimate jumped): trust the new place
+            self.world, self.weight = t["world"].copy(), w_new
+        else:
+            self.world = (self.weight * self.world + w_new * t["world"]) / (self.weight + w_new)
+            self.weight += w_new
+        self.width, self.height = width or self.width, height or self.height
+        self.sightings, self.last_seen = self.sightings + 1, time.time()
+        if self.sightings % 5 == 1:
+            self.save()
+
+    def save(self):
+        import json
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, "w") as f:
+                json.dump({"label": self.label, "world_mm": None if self.world is None else [round(float(v), 1) for v in self.world],
+                           "first_seen_world_mm": None if self.first_world is None else [round(float(v), 1) for v in self.first_world],
+                           "width_mm": self.width, "height_mm": self.height, "sightings": self.sightings,
+                           "last_seen": self.last_seen}, f, indent=2)
+        except OSError:
+            pass
+
+    def load(self):
+        import json
+        try:
+            d = json.load(open(self.path))
+        except (OSError, ValueError):
+            return False
+        if d.get("label") != self.label or not d.get("world_mm"):
+            return False
+        self.world = np.array(d["world_mm"], float)
+        self.first_world = np.array(d.get("first_seen_world_mm") or d["world_mm"], float)
+        self.width, self.height, self.weight, self.sightings = d.get("width_mm"), d.get("height_mm"), 1e-6, d.get("sightings", 0)
+        return True
+
+
 class Perceiver:
     """One call -> where the tracked object is right now (world frame), how big it is, and whether a person is close."""
 
-    def __init__(self, robot, camera_name, gripper_name, cam, intr, model, dargs, label, person_mm, aim_frac=0.5):
+    def __init__(self, robot, camera_name, gripper_name, cam, intr, model, dargs, label, person_mm, aim_frac=0.5, memory=None):
+        self.memory = memory
         self.aim_frac = aim_frac     # where along the object's height to aim: 0.5 = its middle, 0.85 = near the top (the neck of a bottle)
         self.robot, self.camera_name, self.gripper_name, self.cam, self.intr = robot, camera_name, gripper_name, cam, intr
         self.model, self.dargs, self.label, self.person_mm = model, dargs, label, person_mm
@@ -69,8 +121,7 @@ class Perceiver:
                                       # estimate itself shifts ~12 cm with the viewpoint)
 
     def reset(self):
-        self.lock.unlock()
-        self.widths, self.heights = [], []
+        self.lock.unlock()                                # re-lock, but KEEP what we know about the object (width, height, position)
 
     async def _world(self, box, z, w, h):
         """World position of a box's object centre (front surface + half its width), from its box and depth."""
@@ -149,11 +200,17 @@ class Perceiver:
         else:
             rel = (await self.robot.transform_pose(PoseInFrame(reference_frame=self.camera_name, pose=cam_pt), self.gripper_name)).pose
         self.expected = np.array([wp.x, wp.y, wp.z])      # follow this object from now on
-        return {"seen": True, "world": np.array([wp.x, wp.y, wp.z]), "rel_mm": np.array([rel.x, rel.y, rel.z]), "depth_mm": z, "width_mm": width, "height_mm": height,
+        result = {"seen": True, "world": np.array([wp.x, wp.y, wp.z]), "rel_mm": np.array([rel.x, rel.y, rel.z]), "depth_mm": z, "width_mm": width, "height_mm": height,
                 "person_close": person_close}
+        if self.memory is not None:
+            self.memory.update(result, self.width_estimate(), float(np.median(self.heights)) if len(self.heights) >= 3 else None)
+            self.expected = self.memory.world             # follow the remembered object, not just the last sighting
+        return result
 
     def width_estimate(self):
-        return float(np.median(self.widths)) if len(self.widths) >= 3 else None
+        if len(self.widths) >= 3:
+            return float(np.median(self.widths))
+        return self.memory.width if self.memory is not None else None
 
 
 async def main_async(args):
@@ -166,7 +223,12 @@ async def main_async(args):
         ip = (await cam.get_properties()).intrinsic_parameters
         intr = {"fx": ip.focal_x_px, "fy": ip.focal_y_px, "cx": ip.center_x_px, "cy": ip.center_y_px, "w": ip.width_px, "h": ip.height_px}
         model, dargs = load_detector(args.object)
-        eye = Perceiver(robot, args.camera, args.gripper, cam, intr, model, dargs, args.object, args.person_mm, args.aim_height_frac)
+        memory = ObjectMemory(args.memory_file, args.object)
+        if args.use_memory and memory.load():
+            print(f"loaded the remembered {args.object}: world {np.round(memory.world)}, width {memory.width}", flush=True)
+        eye = Perceiver(robot, args.camera, args.gripper, cam, intr, model, dargs, args.object, args.person_mm, args.aim_height_frac, memory)
+        if memory.world is not None:
+            eye.expected = memory.world
         if args.near_world:
             eye.expected = np.array([float(v) for v in args.near_world.split(",")])
 
@@ -192,12 +254,24 @@ async def main_async(args):
                                                                                            z=float(known_world[2]))), args.gripper)).pose
             return np.array([p.x, p.y, p.z])
 
-        async def go_rel(v):
-            """Plan a move of v (mm, gripper frame) from where the gripper is now, keeping its orientation."""
+        def object_obstacle():
+            """The remembered object as a box obstacle for the planner (so planned moves go around it), or None until its size is known."""
+            if memory.world is None or not memory.width or not memory.height:
+                return None
+            g = Geometry(center=Pose(x=float(memory.world[0]), y=float(memory.world[1]), z=float(memory.world[2])),
+                         box=RectangularPrism(dims_mm=Vector3(x=memory.width + 30, y=memory.width + 30, z=memory.height + 30)), label=args.object)
+            return WorldState(obstacles=[GeometriesInFrame(reference_frame="world", geometries=[g])])
+
+        async def go_rel(v, touch_ok=False):
+            """Plan a move of v (mm, gripper frame) from where the gripper is now, keeping its orientation. The remembered object is
+            an obstacle, except for the final advance (touch_ok), where the fingers must be allowed to straddle it."""
             p = (await robot.transform_pose(PoseInFrame(reference_frame=args.gripper, pose=Pose(x=float(v[0]), y=float(v[1]), z=float(v[2]))),
                                             "world")).pose
+            allow = Constraints(collision_specification=[CollisionSpecification(allows=[
+                CollisionSpecification.AllowedFrameCollisions(frame1=args.gripper, frame2=args.object)])]) if touch_ok else None
             await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=Pose(
-                x=p.x, y=p.y, z=max(p.z, args.min_z_mm), o_x=p.o_x, o_y=p.o_y, o_z=p.o_z, theta=p.theta)))
+                x=p.x, y=p.y, z=max(p.z, args.min_z_mm), o_x=p.o_x, o_y=p.o_y, o_z=p.o_z, theta=p.theta)),
+                world_state=object_obstacle(), constraints=allow)
 
         async def next_target(prev, misses):
             """look; wait while a person is close; returns (target, misses)."""
@@ -291,13 +365,12 @@ async def main_async(args):
         for cycle in range(1, args.max_cycles + 1):
             tgt, misses = await next_target(prev, misses)
             if tgt:
-                prev = known = tgt["world"]
+                prev, known = tgt["world"], memory.world       # remembered position (weighted by the closest sightings)
             elif misses > 2:                               # still lost after a few tries: go and look for it
                 tgt = await reacquire(known)
                 if not tgt:
                     raise SystemExit("could not find the object again after searching nearby; stopping")
-                misses, prev = 0, tgt["world"]
-                known = prev
+                misses, prev, known = 0, tgt["world"], memory.world
             rel = await rel_of(tgt, known)                 # object in the gripper frame (a stationary object: last known if out of view)
             pre_g = rel - unit(rel) * args.standoff_mm       # stop standoff_mm short of it, along the line to it
             if np.linalg.norm(pre_g) < args.tol_mm:
@@ -352,25 +425,24 @@ async def main_async(args):
         if not confirm("ADVANCE along the gripper axis onto the object (re-planned every step), then CLOSE and lift."):
             return
         eye.reset()
-        misses, last = 0, tgt["world"]
+        misses, last = 0, memory.world if memory.world is not None else tgt["world"]
         for cycle in range(1, args.max_cycles + 1):
             t, misses = await next_target(last, misses)
             gp = await gripper_pose()
             gpos, axis = np.array([gp.x, gp.y, gp.z]), unit([gp.o_x, gp.o_y, gp.o_z])
             if t:
-                last = t["world"]
+                last = memory.world
             elif misses > 3 and np.linalg.norm(last - gpos) > 200:
                 t = await reacquire(last)
                 if not t:
                     raise SystemExit("lost the object while it was still far away and could not find it again; stopping")
-                misses, last = 0, t["world"]
+                misses, last = 0, memory.world
                 gp = await gripper_pose()
                 gpos, axis = np.array([gp.x, gp.y, gp.z]), unit([gp.o_x, gp.o_y, gp.o_z])
             rel = await rel_of(t, last)                    # gripper frame; dead-reckons from the last known spot when out of view
             along, lat = float(rel[2]), float(np.hypot(rel[0], rel[1]))
-            if not t and lat > args.blind_lat_mm:          # never swing sideways on a stale position (this knocked a bottle over)
-                raise SystemExit(f"the object is out of view and {lat:.0f} mm off-axis (> {args.blind_lat_mm:.0f}): not moving blind. "
-                                 "Re-run so it can see the object again.")
+            if not t and lat > args.blind_lat_mm:          # the remembered position is implausibly far off the gripper axis
+                raise SystemExit(f"the remembered object is {lat:.0f} mm off the gripper axis (> {args.blind_lat_mm:.0f}): the memory looks wrong; stopping.")
             cap = lambda v: float(np.clip(0.7 * v, -args.lat_step_mm, args.lat_step_mm))
             if lat > args.align_tol_mm:                    # ALIGN FIRST: sideways/vertical only, and stay clear of the object
                 back = max(args.clearance_mm - along, 0.0)
@@ -381,7 +453,7 @@ async def main_async(args):
             if along <= args.hold_mm + args.tol_mm:
                 break
             adv = min(args.step_mm, along - args.hold_mm)
-            await go_rel(np.array([cap(rel[0]), cap(rel[1]), adv]))
+            await go_rel(np.array([cap(rel[0]), cap(rel[1]), adv]), touch_ok=along <= args.clearance_mm + args.step_mm)
             print(f"[C {cycle}] {along:.0f} mm along the axis, {lat:.0f} mm off to the side" + ("" if t else " (out of view)"), flush=True)
         else:
             raise SystemExit("did not reach the object within the cycle limit")
@@ -424,6 +496,9 @@ def main():
     ap.add_argument("--arm", default="arm")
     ap.add_argument("--gripper", default="gripper")
     ap.add_argument("--sink", choices=["sim", "viam"], default="sim", help="sim = dry run, nothing moves")
+    ap.add_argument("--memory-file", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "object_memory.json"),
+                    help="where the object's remembered position and size are saved")
+    ap.add_argument("--use-memory", action="store_true", help="start from the remembered object position/size in --memory-file (it may be stale)")
     ap.add_argument("--near-world", help="x,y,z (mm, world): start with the object nearest this point (to pick a particular one)")
     ap.add_argument("--looks", type=int, default=8, help="dry run: how many times to look (move the object to watch it follow)")
     ap.add_argument("--standoff-mm", type=float, default=250.0, help="pre-grasp distance short of the object (the wrist is flattened here, "
@@ -431,7 +506,8 @@ def main():
     ap.add_argument("--align-tol-mm", type=float, default=30.0, help="off-axis error above which it only aligns (no forward motion)")
     ap.add_argument("--clearance-mm", type=float, default=120.0, help="stay at least this far ahead of the object while aligning")
     ap.add_argument("--lat-step-mm", type=float, default=25.0, help="longest sideways correction per step")
-    ap.add_argument("--blind-lat-mm", type=float, default=80.0, help="refuse to correct more than this sideways when the object is out of view")
+    ap.add_argument("--blind-lat-mm", type=float, default=400.0, help="out of view it goes to the REMEMBERED position in capped, planned steps; "
+                    "refuse if that is further than this off the gripper axis (a wrong memory)")
     ap.add_argument("--hold-mm", type=float, default=0.0, help="stop this far short of the object centre along the gripper axis")
     ap.add_argument("--step-mm", type=float, default=100.0, help="longest planned step (shorter = reacts faster to a moved object)")
     ap.add_argument("--tol-mm", type=float, default=30.0)
