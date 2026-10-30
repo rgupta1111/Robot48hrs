@@ -15,7 +15,9 @@ import argparse
 import os
 import sys
 import time
+import webbrowser
 
+import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -24,6 +26,7 @@ from local_detect import Lock, Range, detect, load_detector, object_candidates  
 from mimic.pickup import check_jacobian, smooth_move, table_floor_z  # noqa: E402
 from mimic.servo import (FeatureFilter, approach_factor, estimate_jacobian, features, servo_step,  # noqa: E402
                          tip_target_v)
+from mimic.ui import UIServer  # noqa: E402
 from tidy.robot import TableToWorld, ViamRobot  # noqa: E402
 
 
@@ -60,6 +63,9 @@ def main():
     ap.add_argument("--max-torque", type=int, default=30, help="grip force limit 1-100%% (UFactory G2 gripper only)")
     ap.add_argument("--lift-mm", type=float, default=120.0)
     ap.add_argument("--max-cycles", type=int, default=600)
+    ap.add_argument("--ui", action="store_true", help="serve the local web page (camera view, chat, STOP) and open it; "
+                    "typing 'pick up the cup' starts the run, 'yes' answers the gripper question")
+    ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--yes", action="store_true", help="skip the typed confirmations (not recommended)")
     if preset:
         ap.set_defaults(bounds=PRESETS[preset]["bounds"])
@@ -82,9 +88,40 @@ def main():
     except Exception:
         pass
     lock, flt = Lock(max_jump_frac=0.5, lost_after=10 ** 6), FeatureFilter(alpha=args.smooth_features, beta=0.0)
+    flags = {"stop": False, "paused": False, "yes": None, "go": not args.ui}
+    view = {"frame": None, "text": "starting", "state": "starting", "aim": None}
+    ui = None
 
     def confirm(question):
-        return args.yes or input(f"{question} Type 'yes' to continue: ").strip().lower() == "yes"
+        if args.yes:
+            return True
+        if ui:                                              # answer in the chat box instead of the terminal
+            flags["yes"] = None
+            ui.say(question + " Reply 'yes' to continue or 'no' to cancel.")
+            t0 = time.monotonic()
+            while flags["yes"] is None and not flags["stop"] and time.monotonic() - t0 < 90:
+                time.sleep(0.2)
+            return bool(flags["yes"])
+        return input(f"{question} Type 'yes' to continue: ").strip().lower() == "yes"
+
+    def show(state, text):
+        """Update the status and push the annotated camera frame to the page."""
+        view["state"], view["text"] = state, text
+        if not ui or view["frame"] is None:
+            return
+        img, h = view["frame"].copy(), view["frame"].shape[0]
+        if lock.locked:
+            b = [int(v) for v in lock.box]
+            cv2.rectangle(img, (b[0], b[1]), (b[2], b[3]), (0, 200, 0), 3)
+        if view["aim"] is not None:                         # where the gripper points: the cup should sit on this line
+            y = int((0.5 + view["aim"]) * h)
+            cv2.line(img, (0, y), (img.shape[1], y), (0, 140, 255), 1)
+        for i, line in enumerate((("LIVE ARM" if real else "DRY RUN - nothing moves"), text[:60])):
+            cv2.putText(img, line, (12, 28 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
+            cv2.putText(img, line, (12, 28 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if ok:
+            ui.set_frame(buf.tobytes())
 
     def position():
         p = robot.get_pose()
@@ -95,6 +132,7 @@ def main():
         frame = robot.get_frame(args.camera)
         if frame is None:
             return None, None, None
+        view["frame"] = frame
         lock.update(object_candidates(detect(model, frame, dargs), args.object), frame.shape[1])
         if not lock.locked:
             return None, None, frame
@@ -161,9 +199,51 @@ def main():
         except Exception:
             pass
 
+    if args.ui:
+        def on_text(text):
+            t = text.lower().strip()
+            if "stop" in t:
+                flags["stop"] = True
+                if real:
+                    robot.stop()
+                return "Stopped. Nothing else will move."
+            if t in ("yes", "y", "confirm", "ok", "go ahead"):
+                flags["yes"] = True
+                return "OK."
+            if t in ("no", "n", "cancel"):
+                flags["yes"] = False
+                return "Cancelled."
+            if "pause" in t:
+                flags["paused"] = True
+                return "Paused."
+            if "resume" in t or "continue" in t:
+                flags["paused"] = False
+                return "Resumed."
+            if any(w in t for w in ("pick", "grab", "get", "fetch", "go to", "bring")):
+                if flags["go"]:
+                    return "Already on it."
+                flags["go"] = True
+                return (f"Going to get the {args.object}: probe, line up, approach, grasp, lift." if real else
+                        f"DRY RUN: showing how I would get the {args.object}; nothing will move.")
+            if "see" in t or "status" in t:
+                return view["text"]
+            return "I understand: pick up the cup, stop, pause, resume, yes / no, what do you see."
+
+        ui = UIServer(on_text, lambda: {"mode": "LIVE ARM" if real else "DRY RUN", "state": view["state"],
+                                        "target": args.object}, args.port).start()
+        print("UI:", ui.url, flush=True)
+        webbrowser.open(ui.url)
+
     try:
+        if ui:                                              # watch the object until told to go
+            while not flags["go"] and not flags["stop"]:
+                s0, d0, _ = see()
+                show("waiting", ("object in view" if s0 is not None else "object NOT in view") + " - say 'pick up the cup'")
+                time.sleep(0.1)
+            if flags["stop"]:
+                return
         if real:
-            if not confirm(f"The arm WILL move to pick up '{args.object}' (bounds {bounds}). E-stop in reach?"):
+            if not ui and not confirm(f"The arm WILL move to pick up '{args.object}' (bounds {bounds}). E-stop in reach?"):
                 return
             if args.arm_speed:
                 try:
@@ -177,11 +257,17 @@ def main():
             print("DRY RUN: nothing will move; printing where the gripper would go")
         target, prev, last_t, misses, errs = np.zeros(3), np.zeros(3), time.monotonic(), 0, []
         for cycle in range(1, args.max_cycles + 1):
+            if flags["stop"]:
+                break
+            if flags["paused"]:
+                time.sleep(0.2)
+                continue
             s, dist, frame = see()
             now = time.monotonic()
             dt, last_t = min(max(now - last_t, 0.05), 1.0), now
             if s is None:
                 misses += 1
+                show("searching", "object not seen")
                 print(f"[{cycle:3}] object not seen ({misses})", flush=True)
                 flt.reset()
                 if misses > 40:
@@ -193,10 +279,13 @@ def main():
                 f_px = (rng.focal_px * frame.shape[1] / rng.focal_w if rng.focal_px
                         else frame.shape[1] / (2 * np.tan(np.radians(args.hfov) / 2)))
                 target[1] = (-1 if args.tip_flip else 1) * tip_target_v(dist, args.tip_offset_mm, f_px, frame.shape[0])
+            view["aim"] = float(target[1])
             err = target[:2] - s[:2]
             e = float(np.max(np.abs(err)))
             errs = (errs + [e])[-8:]
             arrived = dist is not None and dist <= args.stop_cm and e < 2 * args.deadband
+            show("arrived" if arrived else "tracking", f"offset u{s[0]:+.2f} v{s[1]:+.2f} aim v{target[1]:+.2f}"
+                 + ("" if dist is None else f" {dist:.0f} cm"))
             print(f"[{cycle:3}] offset u{s[0]:+.2f} v{s[1]:+.2f} aim v{target[1]:+.2f}  "
                   + ("" if dist is None else f"{dist:.0f} cm") + ("  ARRIVED" if arrived else ""), flush=True)
             if arrived:
