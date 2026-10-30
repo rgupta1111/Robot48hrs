@@ -47,8 +47,8 @@ def main():
     ap.add_argument("--close-cm", type=float, default=8.0, help="close when the cup is this far from the camera")
     ap.add_argument("--step-mm", type=float, default=30.0, help="longest forward step")
     ap.add_argument("--center-tol", type=float, default=0.04, help="turn joint 1 until the cup is within this of centre (u)")
-    ap.add_argument("--grip-width-mm", type=float, help="the object's width: the fingers close to this opening and cannot squeeze "
-                    "past it. REQUIRED for a real run. (This gripper has no working force limit; a plain close crushed a cup.)")
+    ap.add_argument("--grip-width-mm", type=float, default=70.0, help="the object's width: the fingers close to this opening and cannot squeeze "
+                    "past it (70 mm held the cup). This gripper has no working force limit; a plain close crushed a cup.")
     ap.add_argument("--grip-speed", type=int, default=300, help="closing speed 1-5000 (low = gentle)")
     ap.add_argument("--lift-mm", type=float, default=120.0)
     ap.add_argument("--max-steps", type=int, default=15)

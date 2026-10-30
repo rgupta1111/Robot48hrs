@@ -72,8 +72,8 @@ def main():
     ap.add_argument("--approach-speed", type=float, default=80.0, help="closing speed, mm/s")
     ap.add_argument("--arm-speed", type=float, help="real arm joint speed, deg/s (UFactory: 15 slow, 30 medium, 60 fast)")
     ap.add_argument("--probe-mm", type=float, default=20.0)
-    ap.add_argument("--grip-width-mm", type=float, help="the object's width: the fingers close to this opening and cannot squeeze "
-                    "past it. REQUIRED for a real run. (This gripper has no working force limit; a plain close crushed a cup.)")
+    ap.add_argument("--grip-width-mm", type=float, default=70.0, help="the object's width: the fingers close to this opening and cannot squeeze "
+                    "past it (70 mm held the cup). This gripper has no working force limit; a plain close crushed a cup.")
     ap.add_argument("--grip-speed", type=int, default=300, help="closing speed 1-5000 (low = gentle)")
     ap.add_argument("--lift-mm", type=float, default=120.0)
     ap.add_argument("--max-cycles", type=int, default=600)
