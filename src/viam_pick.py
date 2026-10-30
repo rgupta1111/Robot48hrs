@@ -423,6 +423,52 @@ async def main_async(args):
             await arm.move_to_joint_positions(JointPositions(values=j_here))
             return None
 
+        async def sweep_survey():
+            """ALWAYS run first in a real run: world positions change between runs, so nothing remembered is trusted. Sweep the base from the
+            starting pose in --survey-step-deg steps out to +/- --survey-deg, record the nearest object at each stop, then go back to the
+            stop where the nearest one was seen and lock on it. The memory is reset to that object."""
+            print("initial sweep: looking around from the starting pose (object positions change, so always sweep first) ...", flush=True)
+            j_here = list((await arm.get_joint_positions()).values)
+            offsets = [0.0] + [a * sg for a in np.arange(args.survey_step_deg, args.survey_deg + 1e-6, args.survey_step_deg) for sg in (1.0, -1.0)]
+            seen = []
+            for d in offsets:
+                j = list(j_here)
+                j[0] += d
+                await arm.move_to_joint_positions(JointPositions(values=j))
+                eye.lock.unlock()
+                eye.expected = None
+                best = None
+                for _ in range(3):
+                    t, _ = await next_target(None, 0)
+                    if t and (best is None or t["depth_mm"] < best["depth_mm"]):
+                        best = t
+                    await asyncio.sleep(0.15)
+                if best:
+                    reach = float(np.hypot(*best["world"][:2]))
+                    print(f"  base {d:+.0f} deg: {args.object} {best['depth_mm'] / 10:.0f} cm from the camera (~{reach:.0f} mm from the base)", flush=True)
+                    if reach <= 1000:
+                        seen.append((best["depth_mm"], d))
+            if not seen:
+                await arm.move_to_joint_positions(JointPositions(values=j_here))
+                print("  the sweep saw nothing within reach", flush=True)
+                return None
+            _, d = min(seen)
+            print(f"  nearest: seen at base {d:+.0f} deg; going back there", flush=True)
+            j = list(j_here)
+            j[0] += d
+            await arm.move_to_joint_positions(JointPositions(values=j))
+            eye.lock.unlock()
+            eye.expected = None
+            eye.widths, eye.heights = [], []                      # start fresh on the chosen object (the sweep mixed several)
+            memory.world = memory.first_world = memory.width = memory.height = None
+            memory.weight, memory.sightings = 0.0, 0
+            for _ in range(3):
+                t, _ = await next_target(None, 0)
+                if t:
+                    return t
+                await asyncio.sleep(0.2)
+            return None
+
         async def find_again(known):
             """INITIAL search only (at the start of the run): search; if the first pass finds nothing, go back to the ORIGINAL pose, detect
             again, and search once more. Losing the object mid-run uses the nearby search (reacquire) and does not go back to the start."""
@@ -468,21 +514,21 @@ async def main_async(args):
             reach = float(np.hypot(*known0[:2]))
             print(f"the object is {reach:.0f} mm from the base axis (arm reach ~850 mm); width estimate {eye.width_estimate()} mm", flush=True)
             if reach > 1000:
-                raise SystemExit(f"{reach:.0f} mm from the base axis: far beyond the arm's reach")
+                if not real:
+                    raise SystemExit(f"{reach:.0f} mm from the base axis: far beyond the arm's reach")
+                print(f"the first sighting is {reach:.0f} mm out, beyond reach: the sweep will look for a nearer one", flush=True)
             if reach > args.max_reach_mm:
                 print(f"warning: the world estimate ({reach:.0f} mm) is past {args.max_reach_mm:.0f} mm, but it shifts ~10 cm with the viewpoint; "
                       "the approach is measured in the gripper frame and the motion planner refuses anything truly unreachable", flush=True)
         if not real:
             print("DRY RUN: nothing moved.")
             return
-        if not confirm("The arm WILL make planned moves toward the nearest object, re-planning every step"
-                       + ((" (it cannot see it from here, so it will first search nearby: back off, sweep the base)" if known0 is not None else
-                           f" (no {args.object} in view, so it will first LOOK AROUND: level the gripper with joints 4/5 if needed, scan with the wrist (joints 4 and 5), then sweep the base left and right, up to {args.survey_deg:.0f} degrees)")
-                          if not_in_view else "")
-                       + ". E-stop in reach?"):
+        if not confirm(f"The arm WILL first SWEEP the base left and right (up to {args.survey_deg:.0f} degrees) to find the nearest {args.object}, "
+                       "then make planned moves toward it, re-planning every step. E-stop in reach?"):
             return
-        if not_in_view:
-            tgt = await find_again(known0)
+        tgt = await sweep_survey()                                # ALWAYS: positions change between runs
+        if not tgt:                                               # nothing within reach from the sweep: level the gripper, wrist scan,
+            tgt = await find_again(None)                          # wider base sweep, back to the original pose, once more
             if not tgt:
                 raise SystemExit("could not find a " + args.object + " by looking around; stopping")
 
