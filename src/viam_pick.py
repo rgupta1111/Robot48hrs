@@ -122,6 +122,7 @@ class Perceiver:
     def __init__(self, robot, camera_name, gripper_name, cam, intr, model, dargs, label, person_mm, aim_frac=0.5, memory=None):
         self.memory = memory
         self.color, self.cands, self.last_dmap = None, [], None
+        self.dets, self.lock_info = [], ""      # every detection of the last frame (for the live view) and the locked object's size/depth text
         self.aim_frac = aim_frac     # where along the object's height to aim: 0.5 = its middle, 0.85 = near the top (the neck of a bottle)
         self.robot, self.camera_name, self.gripper_name, self.cam, self.intr = robot, camera_name, gripper_name, cam, intr
         self.model, self.dargs, self.label, self.person_mm = model, dargs, label, person_mm
@@ -173,7 +174,7 @@ class Perceiver:
         self.person_hits = self.person_hits + 1 if near_person else 0
         person_close = self.person_hits >= 2                 # a one-frame flicker does not pause the arm
         cands = object_candidates(dets, self.label)
-        self.color, self.cands = color, list(cands)           # for the web page's live view
+        self.color, self.cands, self.dets = color, list(cands), list(dets)          # for the web page's live view
         if not self.lock.locked:                         # (re)lock: the one nearest where it was; the first time, the nearest by depth
             scored = []
             for c in cands:
@@ -197,6 +198,7 @@ class Perceiver:
         sx, sy = w / self.intr["w"], h / self.intr["h"]
         fx, fy, cx, cy = self.intr["fx"] * sx, self.intr["fy"] * sy, self.intr["cx"] * sx, self.intr["cy"] * sy
         width, height = width_from_depth(box, z, fx), height_from_depth(box, z, fy)
+        self.lock_info = f"{self.label} {z / 10:.0f} cm" + (f"  {width:.0f}x{height:.0f} mm" if width and height else "")
         edge = box[0] < 3 or box[2] > w - 3             # a box clipped by the side of the picture reads too narrow
         if width and not edge:
             self.widths = (self.widths + [width])[-15:]
@@ -336,11 +338,26 @@ async def main_async(args):
             if not ui or eye.color is None:
                 return
             img = eye.color.copy()
+            def tag(b, text, col):
+                cv2.putText(img, text, (b[0], max(b[1] - 6, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+                cv2.putText(img, text, (b[0], max(b[1] - 6, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
+            for d in eye.dets:                                    # every YOLO detection: people in orange (grey = too weak / small to pause the arm)
+                if d[5] == "person":
+                    b = [int(v) for v in d[:4]]
+                    counts = d[4] >= eye.person_conf and (d[3] - d[1]) >= eye.person_min_px
+                    col = (0, 140, 255) if counts else (150, 150, 150)
+                    cv2.rectangle(img, (b[0], b[1]), (b[2], b[3]), col, 2 if counts else 1)
+                    tag(b, f"person {d[4]:.2f}" + ("" if counts else " (ignored)"), col)
             for c in eye.cands:
-                cv2.rectangle(img, (int(c[0]), int(c[1])), (int(c[2]), int(c[3])), (160, 160, 160), 1)
+                b = [int(v) for v in c[:4]]
+                cv2.rectangle(img, (b[0], b[1]), (b[2], b[3]), (200, 200, 200), 1)
+                tag(b, f"{eye.label} {c[4]:.2f}", (200, 200, 200))
             if eye.lock.locked:
                 b = [int(v) for v in eye.lock.box]
-                cv2.rectangle(img, (b[0], b[1]), (b[2], b[3]), (0, 200, 0), 3)
+                cv2.rectangle(img, (b[0], b[1]), (b[2], b[3]), (0, 220, 0), 3)
+                cx_, cy_ = (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+                cv2.drawMarker(img, (cx_, cy_), (0, 220, 0), cv2.MARKER_CROSS, 18, 2)      # the point the gripper aims at (box centre)
+                tag(b, "LOCKED  " + eye.lock_info, (0, 255, 0))
             for k, line in enumerate((("LIVE ARM" if real else "DRY RUN - nothing moves") + f"  |  {state}", text[:64])):
                 cv2.putText(img, line, (12, 26 + 26 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 4)
                 cv2.putText(img, line, (12, 26 + 26 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
