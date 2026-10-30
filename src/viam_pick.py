@@ -517,14 +517,14 @@ async def main_async(args):
             steps = [a * sg for a in np.arange(args.survey_step_deg, args.survey_deg + 1e-6, args.survey_step_deg) for sg in (1.0, -1.0)]
             for d in steps:
                 j = list(j_here)
-                j[0] += d
+                j[args.survey_joint - 1] += d
                 await arm.move_to_joint_positions(JointPositions(values=j))
                 eye.lock.unlock()
                 eye.expected = None                          # nothing to match yet: take the nearest in this view
                 for _ in range(3):
                     t, _ = await next_target(None, 0)
                     if t:
-                        say(f"  found a {args.object} after turning the base {d:+.0f} deg", flush=True)
+                        say(f"  found a {args.object} after turning joint {args.survey_joint} {d:+.0f} deg", flush=True)
                         return t
                     await asyncio.sleep(0.2)
             await arm.move_to_joint_positions(JointPositions(values=j_here))
@@ -574,8 +574,12 @@ async def main_async(args):
             seen = []
             for d in offsets:
                 j = list(j_here)
-                j[0] += d
+                j[args.survey_joint - 1] += d
                 await arm.move_to_joint_positions(JointPositions(values=j))
+                if (await gripper_pose()).z < args.min_z_mm + 40.0:      # a joint-2 stop can bring the gripper down toward the table: skip it
+                    say(f"  joint {args.survey_joint} {d:+.0f} deg: too close to the table, skipping this stop", flush=True)
+                    await arm.move_to_joint_positions(JointPositions(values=j_here))
+                    continue
                 eye.lock.unlock()
                 eye.expected = None
                 best = None
@@ -586,7 +590,7 @@ async def main_async(args):
                     await asyncio.sleep(0.15)
                 if best:
                     reach = float(np.hypot(*best["world"][:2]))
-                    say(f"  base {d:+.0f} deg: {args.object} {best['depth_mm'] / 10:.0f} cm from the camera (~{reach:.0f} mm from the base)", flush=True)
+                    say(f"  joint {args.survey_joint} {d:+.0f} deg: {args.object} {best['depth_mm'] / 10:.0f} cm from the camera (~{reach:.0f} mm from the base)", flush=True)
                     if reach <= 1000:
                         seen.append((best["depth_mm"], d))
             if not seen:
@@ -594,9 +598,9 @@ async def main_async(args):
                 say("  the sweep saw nothing within reach", flush=True)
                 return None
             _, d = min(seen)
-            say(f"  nearest: seen at base {d:+.0f} deg; going back there", flush=True)
+            say(f"  nearest: seen at joint {args.survey_joint} {d:+.0f} deg; going back there", flush=True)
             j = list(j_here)
-            j[0] += d
+            j[args.survey_joint - 1] += d
             await arm.move_to_joint_positions(JointPositions(values=j))
             eye.lock.unlock()
             eye.expected = None
@@ -650,7 +654,7 @@ async def main_async(args):
         not_in_view = tgt is None
         known0 = (eye.expected if not_in_view else tgt["world"])      # None: nothing seen and nothing remembered
         if not_in_view and not real:
-            raise SystemExit(f"no {args.object} with a depth reading in view (a real run would look around: sweep the base +/-{args.survey_deg:.0f} deg)")
+            raise SystemExit(f"no {args.object} with a depth reading in view (a real run would look around: sweep joint {args.survey_joint} +/-{args.survey_deg:.0f} deg)")
         if known0 is not None:
             reach = float(np.hypot(*known0[:2]))
             say(f"the object is {reach:.0f} mm from the base axis (arm reach ~850 mm); width estimate {eye.width_estimate()} mm", flush=True)
@@ -664,10 +668,10 @@ async def main_async(args):
         if not real:
             say("DRY RUN: nothing moved.")
             return
-        if not args.ui and not await confirm(f"The arm WILL first SWEEP the base left and right (up to {args.survey_deg:.0f} degrees) to find the nearest {args.object}, "
+        if not args.ui and not await confirm(f"The arm WILL first SWEEP joint {args.survey_joint} (up to {args.survey_deg:.0f} degrees each way) to find the nearest {args.object}, "
                        "then make planned moves toward it, re-planning every step. E-stop in reach?"):
             return
-        show("sweeping", "sweeping the base to find the nearest " + eye.label)
+        show("sweeping", f"sweeping joint {args.survey_joint} to find the nearest " + eye.label)
         tgt = await sweep_survey()                                # ALWAYS: positions change between runs
         if not tgt:                                               # nothing within reach from the sweep: level the gripper, wrist scan,
             tgt = await find_again(None)                          # wider base sweep, back to the original pose, once more
@@ -810,7 +814,9 @@ def main():
                     "yes/no in the chat answer the confirmations")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-browser", action="store_true", help="with --ui: do not open the page automatically")
-    ap.add_argument("--survey-deg", type=float, default=20.0, help="initial look-around: sweep the base out to +/- this many degrees")
+    ap.add_argument("--survey-joint", type=int, default=2, help="joint rotated for the INITIAL sweep, Viam app numbering (2 = shoulder: "
+                    "sweeps the camera near/far over the table; 1 = base: left/right)")
+    ap.add_argument("--survey-deg", type=float, default=20.0, help="initial look-around: sweep that joint out to +/- this many degrees")
     ap.add_argument("--survey-step-deg", type=float, default=10.0, help="initial look-around: base step between looks")
     ap.add_argument("--near-world", help="x,y,z (mm, world): start with the object nearest this point (to pick a particular one)")
     ap.add_argument("--looks", type=int, default=8, help="dry run: how many times to look (move the object to watch it follow)")
