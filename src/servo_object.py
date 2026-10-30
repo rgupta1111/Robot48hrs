@@ -104,6 +104,10 @@ def main():
     ap.add_argument("--search-steps", type=int, default=5, help="moves toward where the cup vanished before holding")
     ap.add_argument("--bounds", default="250,600,-300,300,0,450")
     ap.add_argument("--ui", action="store_true", help="serve the chat page on http://127.0.0.1:PORT/ and open it")
+    ap.add_argument("--grasp", action="store_true", help="on arrival: ask in the chat, then close the gripper (force-capped) and lift")
+    ap.add_argument("--lift-mm", type=float, default=120.0, help="--grasp: how far to lift after closing")
+    ap.add_argument("--max-torque", type=int, default=30, help="--grasp: grip force limit 1-100%% (UFactory G2 gripper only)")
+    ap.add_argument("--arm-speed", type=float, help="real arm joint speed in deg/s, set at start (UFactory: 15 slow, 30 medium, 60 fast)")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-browser", action="store_true", help="with --ui: do not open the page automatically")
     ap.add_argument("--auto-engage", action="store_true")
@@ -123,6 +127,12 @@ def main():
                                                    standard="yolov8s.pt")
     robot = ViamRobot(args.viam_address, args.arm_name, args.gripper_name, None, TableToWorld(*floats(args.table_to_world)),
                       workspace=bounds[:4], max_z_mm=bounds[5], insecure=args.viam_insecure)
+    if real and args.arm_speed:
+        try:
+            robot.arm_command({"set_speed": args.arm_speed})
+            print(f"arm speed set to {args.arm_speed:.0f} deg/s", flush=True)
+        except Exception as e:
+            print(f"could not set the arm speed ({type(e).__name__}: {e}); using the configured speed", flush=True)
     lock = Lock(max_jump_frac=0.5, lost_after=10 ** 6)   # the picture jumps when the gripper moves; loss is handled below
     J = None
     if os.path.exists(JAC_FILE) and not args.probe:
@@ -314,6 +324,10 @@ def main():
             if "stop_cm" in c:
                 stop_cm = max(2.0, c["stop_cm"])
             engaged = True
+            memo["grasped"] = False
+            if args.grasp and real and not memo.get("opened"):
+                robot.set_gripper(True)                      # open before going in
+                memo["opened"] = True
             say(f"Going for the {name}: centring it, then moving forward to {stop_cm:.0f} cm."
                 + ("" if real else " (Dry run: the arm will not move.)")
                 + (" First I'll make three small test moves to learn the camera." if real and J is None else ""))
@@ -354,6 +368,25 @@ def main():
                 say("Reset done.")
             else:
                 say("Dry run: I would move to the reset pose now.")
+        elif k == "yes" and pending["confirm"] == "grasp":
+            pending["confirm"], memo["grasped"], engaged = None, True, False
+            if not real:
+                say(f"Dry run: I would close the gripper (force cap {args.max_torque}%) and lift {args.lift_mm:.0f} mm.")
+            else:
+                try:   # UFactory G2 only; a G1 has no force setting, so the close below is then unlimited
+                    robot.gripper_command({"set_gripper_torque": args.max_torque})
+                except Exception as e:
+                    say(f"(could not cap the grip force: {type(e).__name__}; closing at the default force)")
+                robot.set_gripper(False)
+                time.sleep(1.5)
+                pos = current()
+                robot.move_xyz(pos[0], pos[1], min(pos[2] + args.lift_mm, bounds[5]), wait=True)
+                shared["cur"] = current()
+                try:
+                    held = bool(robot._run(robot.gripper.is_holding_something()).value)
+                except Exception:
+                    held = None
+                say("Closed the gripper and lifted." + ("" if held is None else f" Holding something: {held}."))
         elif k in ("yes", "no"):
             pending["confirm"] = None
             say("OK." if k == "no" else "Nothing to confirm.")
@@ -493,6 +526,10 @@ def main():
             if status != prev_status:
                 if status.startswith("ARRIVED"):
                     say(f"Arrived: the {det['name']} is about {dist_cm:.0f} cm away. Holding here.")
+                    if args.grasp and not memo.get("grasped"):
+                        pending["confirm"] = "grasp"
+                        say(f"Close the gripper on it (force cap {args.max_torque}%) and lift {args.lift_mm:.0f} mm? "
+                            "Type 'yes' to go, or 'no' to leave it.")
                 elif status.startswith("lost"):
                     say(f"I lost sight of the {det['name']}. Holding position." if seen else
                         f"I can't see a {det['name']} in the camera. Move it into view or try another name.")
