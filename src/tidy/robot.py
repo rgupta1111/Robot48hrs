@@ -290,6 +290,19 @@ class ViamRobot:
         """Arm DoCommand (model-specific, e.g. the UFactory {"set_speed": deg_per_s})."""
         return self._run(self.arm.do_command(command))
 
+    def close_to_width(self, width_mm, units_per_mm=10.0, squeeze_mm=0.0, speed=300):
+        """Close the gripper to a SET opening (position control) instead of a plain grab(). The fingers stop at that width
+        and cannot squeeze past it, whatever the gripper's force: use the object's width. (UFactory: 0-850 = fully closed
+        to fully open, ~10 units per mm; speed 1-5000, low = gentle.) Returns the commanded position."""
+        if speed:
+            try:
+                self.gripper_command({"set_gripper_speed": int(speed)})
+            except Exception:
+                pass
+        pos = float(min(max((width_mm - squeeze_mm) * units_per_mm, 0.0), 850.0))
+        self.gripper_command({"set": pos})
+        return pos
+
     def gripper_command(self, command):
         """Gripper DoCommand (model-specific, e.g. the UFactory {"set": pos} / {"grab_with_torque": {...}})."""
         if self.gripper is None:

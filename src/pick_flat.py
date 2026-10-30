@@ -47,13 +47,17 @@ def main():
     ap.add_argument("--close-cm", type=float, default=8.0, help="close when the cup is this far from the camera")
     ap.add_argument("--step-mm", type=float, default=30.0, help="longest forward step")
     ap.add_argument("--center-tol", type=float, default=0.04, help="turn joint 1 until the cup is within this of centre (u)")
-    ap.add_argument("--max-torque", type=int, default=30, help="grip force limit 1-100%% (UFactory G2 gripper only)")
+    ap.add_argument("--grip-width-mm", type=float, help="the object's width: the fingers close to this opening and cannot squeeze "
+                    "past it. REQUIRED for a real run. (This gripper has no working force limit; a plain close crushed a cup.)")
+    ap.add_argument("--grip-speed", type=int, default=300, help="closing speed 1-5000 (low = gentle)")
     ap.add_argument("--lift-mm", type=float, default=120.0)
     ap.add_argument("--max-steps", type=int, default=15)
     ap.add_argument("--yes", action="store_true", help="skip the typed confirmations (not recommended)")
     args = ap.parse_args()
 
     real, b = args.sink == "viam", [float(v) for v in args.bounds.split(",")]
+    if real and args.grip_width_mm is None:
+        raise SystemExit("give --grip-width-mm (the object's width in mm) before a real run: the gripper closes to that opening.")
     lo, hi = np.array(b[0::2]), np.array(b[1::2])
     model, dargs = load_detector(args.object)
     robot = ViamRobot(args.viam_address, "arm", "gripper", workspace=b[:4], max_z_mm=b[5])
@@ -91,7 +95,7 @@ def main():
               f"y{position()[1]:.0f} z{position()[2]:.0f} mm", flush=True)
         total = max(d_cm - args.close_cm, 0.0) * 10.0
         print(f"plan: advance about {total:.0f} mm along the gripper axis in steps of <= {args.step_mm:.0f} mm, centring with joint 1, "
-              f"then close (force cap {args.max_torque}%) at {args.close_cm:.0f} cm and lift {args.lift_mm:.0f} mm", flush=True)
+              f"then close  at {args.close_cm:.0f} cm and lift {args.lift_mm:.0f} mm", flush=True)
         if not real:
             print("DRY RUN: nothing moved.")
             return
@@ -144,20 +148,14 @@ def main():
             print(f"[advance {step:2}] {adv:.0f} mm -> about {d_cm:.1f} cm to go{seen}; tool x{goal[0]:.0f} y{goal[1]:.0f} z{goal[2]:.0f}", flush=True)
         else:
             raise SystemExit("did not reach the cup within the step limit")
-        if not confirm(f"At about {d_cm:.0f} cm from the cup. CLOSE the gripper (force cap {args.max_torque}%) and lift."):
+        if not confirm(f"At about {d_cm:.0f} cm from the cup. CLOSE the gripper to an opening of {args.grip_width_mm:.0f} mm "
+                       f"(position, speed {args.grip_speed}) and lift."):
             return
-        try:
-            robot.gripper_command({"set_gripper_torque": args.max_torque})
-        except Exception as e:
-            print(f"could not cap the grip force ({type(e).__name__}); closing at the default force")
-        robot.set_gripper(False)
-        time.sleep(1.5)
+        pos = robot.close_to_width(args.grip_width_mm, speed=args.grip_speed)
+        time.sleep(2.0)
+        print(f"gripper commanded to {pos:.0f}, now {robot.gripper_command({'get': True})}", flush=True)
         pos = position()
         robot.move_xyz(pos[0], pos[1], min(pos[2] + args.lift_mm, hi[2]), wait=True)
-        try:
-            print("holding something:", bool(robot._run(robot.gripper.is_holding_something()).value))
-        except Exception:
-            pass
     except KeyboardInterrupt:
         print("interrupted")
     finally:

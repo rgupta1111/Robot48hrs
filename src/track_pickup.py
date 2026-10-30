@@ -72,7 +72,9 @@ def main():
     ap.add_argument("--approach-speed", type=float, default=80.0, help="closing speed, mm/s")
     ap.add_argument("--arm-speed", type=float, help="real arm joint speed, deg/s (UFactory: 15 slow, 30 medium, 60 fast)")
     ap.add_argument("--probe-mm", type=float, default=20.0)
-    ap.add_argument("--max-torque", type=int, default=30, help="grip force limit 1-100%% (UFactory G2 gripper only)")
+    ap.add_argument("--grip-width-mm", type=float, help="the object's width: the fingers close to this opening and cannot squeeze "
+                    "past it. REQUIRED for a real run. (This gripper has no working force limit; a plain close crushed a cup.)")
+    ap.add_argument("--grip-speed", type=int, default=300, help="closing speed 1-5000 (low = gentle)")
     ap.add_argument("--lift-mm", type=float, default=120.0)
     ap.add_argument("--max-cycles", type=int, default=600)
     ap.add_argument("--ui", action="store_true", help="serve the local web page (camera view, chat, STOP) and open it; "
@@ -84,6 +86,8 @@ def main():
     args = ap.parse_args()
 
     real, bounds = args.sink == "viam", floats(args.bounds)
+    if real and args.grip_width_mm is None:
+        raise SystemExit("give --grip-width-mm (the object's width in mm) before a real run: the gripper closes to that opening.")
     stop_cm = args.rotate_cm if args.wrist_flat else args.stop_cm       # where the tracking stops
     lo, hi = np.array(bounds[0::2], float), np.array(bounds[1::2], float)
     floor = table_floor_z(args.table_z_mm, args.tool_length_mm, args.table_margin_mm)
@@ -254,21 +258,18 @@ def main():
                 return
             advance_mm = max(args.rotate_cm - args.close_cm, 0.0) * 10.0
             if not confirm(f"ADVANCE {advance_mm:.0f} mm along the gripper axis (camera {args.rotate_cm:.0f} -> {args.close_cm:.0f} cm "
-                           f"from the cup), then CLOSE the gripper (force cap {args.max_torque}%) and lift."):
+                           f"from the cup), then CLOSE the gripper (to a {args.grip_width_mm:.0f} mm opening) and lift."):
                 return
             pn = robot.get_pose()
             robot._orient = None                         # hold the NEW (flat) orientation for the moves that follow
             goal = np.clip(advance_along(position(), (pn.o_x, pn.o_y, pn.o_z), advance_mm), lo, hi)
             robot.move_xyz(*goal, wait=True)
             time.sleep(0.5)
-        elif not confirm(f"Arrived at {stop_cm:.0f} cm. About to CLOSE the gripper (force cap {args.max_torque}%) and lift."):
+        elif not confirm(f"Arrived at {stop_cm:.0f} cm. About to CLOSE the gripper (to a {args.grip_width_mm:.0f} mm opening) and lift."):
             return
-        try:   # UFactory G2 only; a G1 has no force setting, so the close is then unlimited
-            robot.gripper_command({"set_gripper_torque": args.max_torque})
-        except Exception as e:
-            print(f"could not cap the grip force ({type(e).__name__}); closing at the default force")
-        robot.set_gripper(False)
-        time.sleep(1.5)
+        pos_cmd = robot.close_to_width(args.grip_width_mm, speed=args.grip_speed)   # position, not force
+        time.sleep(2.0)
+        print(f"gripper commanded to {pos_cmd:.0f}, now {robot.gripper_command({'get': True})}", flush=True)
         pos = position()
         robot.move_xyz(pos[0], pos[1], min(pos[2] + args.lift_mm, bounds[5]), wait=True)
         try:
