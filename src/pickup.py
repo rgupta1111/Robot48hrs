@@ -17,13 +17,16 @@ import argparse
 import os
 import sys
 import time
+import webbrowser
 
+import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from arm_mimic import PRESETS, floats  # noqa: E402
 from mimic.pickup import PickupConfig, PickupPlanner  # noqa: E402
 from mimic.servo import estimate_jacobian, features  # noqa: E402
+from mimic.ui import UIServer  # noqa: E402
 from mimic.size import WidthEstimator, grip_position, scale_focal  # noqa: E402
 from tidy.robot import TableToWorld, ViamRobot  # noqa: E402
 
@@ -63,6 +66,8 @@ def main():
     ap.add_argument("--lift-mm", type=float, default=120.0)
     ap.add_argument("--settle", type=float, default=0.8, help="seconds to wait after a move before reading the camera")
     ap.add_argument("--max-cycles", type=int, default=200)
+    ap.add_argument("--ui", action="store_true", help="serve the local web page (live camera, status, STOP) and open it")
+    ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--yes", action="store_true", help="skip the typed confirmations (not recommended)")
     if preset:
         ap.set_defaults(bounds=PRESETS[preset]["bounds"])
@@ -79,26 +84,53 @@ def main():
     if args.segmenter and not intr:
         print("camera reports no intrinsics: width estimation off, the gripper will close with its default force")
 
+    lock = {"centre": None, "seg_ok": bool(args.segmenter)}
+    view = {"frame": None, "box": None, "text": "starting"}
+    flags = {"stop": False, "paused": False}
+
     def see():
-        """-> (features, distance mm or None) of the best matching detection, or (None, None)."""
+        """-> (features, distance mm or None) of the locked cup. The first pick is the NEAREST cup (largest box, i.e.
+        closest to the camera); after that it stays on the cup nearest to where the lock last was, so a second cup
+        in view never steals it. (None, None) when no cup is seen."""
         frame, dets = robot.detect(args.vision, args.camera, args.min_confidence)
+        view["frame"], view["box"] = frame, None
         dets = [d for d in dets if args.object.lower() in d.class_name.lower()]
         if not dets:
             return None, None
-        d = max(dets, key=lambda d: d.confidence)
         h_img, w_img = frame.shape[:2] if frame is not None else ((intr["h"], intr["w"]) if intr else (720, 1280))
-        s = features((d.x_min, d.y_min, d.x_max, d.y_max), w_img, h_img)
+        centre = lambda d: ((d.x_min + d.x_max) / 2, (d.y_min + d.y_max) / 2)
+        if lock["centre"] is None:
+            d = max(dets, key=lambda d: (d.y_max - d.y_min) * (d.x_max - d.x_min))      # nearest = biggest on screen
+        else:
+            lx, ly = lock["centre"]
+            d = min(dets, key=lambda d: np.hypot(centre(d)[0] - lx, centre(d)[1] - ly))
+            if np.hypot(centre(d)[0] - lx, centre(d)[1] - ly) > 0.25 * w_img:           # jumped: lost our cup
+                lock["centre"] = None
+                return None, None
+        lock["centre"] = centre(d)
+        box = (d.x_min, d.y_min, d.x_max, d.y_max)
+        view["box"] = box
+        s = features(box, w_img, h_img)
         dist = fy * args.object_height_mm / (s[2] * h_img) if fy and s[2] > 0 else None
-        if args.segmenter:                                  # true depth from the point cloud beats the height guess
-            _, objs = robot.objects(args.segmenter, args.camera)
-            objs = [o for o in objs if args.object.lower() in o[0].lower()]
-            if objs:
-                z = min(objs, key=lambda o: o[1][0] ** 2 + o[1][1] ** 2)[1][2]
-                if z > 0:
-                    dist = z
+        if lock["seg_ok"]:                                  # true depth from the point cloud beats the height guess
+            try:
+                _, objs = robot.objects(args.segmenter, args.camera)
+            except Exception as e:                          # e.g. a dropped stream: carry on with the height estimate
+                print(f"segmenter failed ({type(e).__name__}); using height-based distance, no width estimate", flush=True)
+                lock["seg_ok"] = False
+                objs = []
+            objs = [o for o in objs if args.object.lower() in o[0].lower() and o[1][2] > 0]
+            if objs and intr:
+                sc = w_img / intr["w"]                      # match the cloud object whose projection is nearest the box
+                proj = lambda o: (intr["cx"] * sc + intr["fx"] * sc * o[1][0] / o[1][2],
+                                  intr["cy"] * sc + intr["fy"] * sc * o[1][1] / o[1][2])
+                cx0, cy0 = centre(d)
+                o = min(objs, key=lambda o: np.hypot(proj(o)[0] - cx0, proj(o)[1] - cy0))
+                if np.hypot(proj(o)[0] - cx0, proj(o)[1] - cy0) < 0.25 * w_img:
+                    dist = o[1][2]
                     if widthest is not None:
                         widthest.fx = scale_focal(intr["fx"], intr["w"], w_img)
-                        widthest.update((d.x_min, d.y_min, d.x_max, d.y_max), z)
+                        widthest.update(box, dist)
         return s, dist
 
     def position():
@@ -158,6 +190,47 @@ def main():
             raise SystemExit("probe: the object did not move in the image; cannot servo")
         return J
 
+    ui = None
+    if args.ui:
+        def on_text(text):
+            t = text.lower()
+            if "stop" in t:
+                flags["stop"] = True
+                if real:
+                    robot.stop()
+                return "Stopped. Nothing else will move."
+            if "pause" in t:
+                flags["paused"] = True
+                return "Paused."
+            if "resume" in t or "continue" in t:
+                flags["paused"] = False
+                return "Resumed."
+            if "see" in t or "status" in t:
+                return view["text"]
+            return "I understand: stop, pause, resume, status / what do you see."
+
+        def get_status():
+            return {"mode": "LIVE ARM" if real else "DRY RUN", "state": view.get("state", "starting"), "target": args.object}
+
+        ui = UIServer(on_text, get_status, args.port).start()
+        print("UI:", ui.url, flush=True)
+        webbrowser.open(ui.url)
+
+    def show(planner, act, seen):
+        view["text"] = f"{planner.state}: {act.kind} {act.note} - {seen}"
+        view["state"] = planner.state
+        if ui and view["frame"] is not None:
+            img = view["frame"].copy()
+            if view["box"] is not None:
+                b = [int(v) for v in view["box"]]
+                cv2.rectangle(img, (b[0], b[1]), (b[2], b[3]), (0, 200, 0), 3)
+            for i, line in enumerate((("LIVE ARM" if real else "DRY RUN - nothing moves"), view["text"][:70])):
+                cv2.putText(img, line, (14, 34 + 34 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 5)
+                cv2.putText(img, line, (14, 34 + 34 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if ok:
+                ui.set_frame(buf.tobytes())
+
     try:
         if real:
             if not confirm(f"The arm WILL move to pick up '{args.object}' (bounds {bounds}). E-stop in reach?"):
@@ -170,12 +243,16 @@ def main():
                            descend_step_mm=args.descend_step, grasp_distance_mm=args.grasp_distance_mm,
                            lift_mm=args.lift_mm, max_cycles=args.max_cycles)
         planner = PickupPlanner(J, cfg)
-        while True:
+        while not flags["stop"]:
+            if flags["paused"]:
+                time.sleep(0.2)
+                continue
             s, dist = see()
             act = planner.step(s, dist)
             seen = "not seen" if s is None else f"u{s[0]:+.2f} v{s[1]:+.2f} h{s[2]:.2f}" + (f" {dist:.0f}mm" if dist else "")
             print(f"[{planner.cycles:3}] {planner.state:8} {act.kind:10} {act.note:28} {seen}"
                   + (f"  move {act.move[0]:+.0f} {act.move[1]:+.0f} {act.move[2]:+.0f}" if act.kind == "move" else ""), flush=True)
+            show(planner, act, seen)
             if act.kind in ("done", "abort"):
                 break
             if not real:
@@ -191,6 +268,10 @@ def main():
                 time.sleep(1.5)
             elif act.kind == "move":
                 move_by(act.move)
+        if ui and not flags["stop"]:
+            print("finished; UI stays up - Ctrl+C to quit", flush=True)
+            while not flags["stop"]:
+                time.sleep(0.5)
     except KeyboardInterrupt:
         print("interrupted")
     finally:
