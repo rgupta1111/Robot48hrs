@@ -365,10 +365,20 @@ async def main_async(args):
                 gpos, axis = np.array([gp.x, gp.y, gp.z]), unit([gp.o_x, gp.o_y, gp.o_z])
             rel = await rel_of(t, last)                    # gripper frame; dead-reckons from the last known spot when out of view
             along, lat = float(rel[2]), float(np.hypot(rel[0], rel[1]))
+            if not t and lat > args.blind_lat_mm:          # never swing sideways on a stale position (this knocked a bottle over)
+                raise SystemExit(f"the object is out of view and {lat:.0f} mm off-axis (> {args.blind_lat_mm:.0f}): not moving blind. "
+                                 "Re-run so it can see the object again.")
+            cap = lambda v: float(np.clip(0.7 * v, -args.lat_step_mm, args.lat_step_mm))
+            if lat > args.align_tol_mm:                    # ALIGN FIRST: sideways/vertical only, and stay clear of the object
+                back = max(args.clearance_mm - along, 0.0)
+                await go_rel(np.array([cap(rel[0]), cap(rel[1]), -back]))
+                print(f"[C {cycle}] aligning: {lat:.0f} mm off-axis, {along:.0f} mm ahead" + (f", backing off {back:.0f} mm" if back else "")
+                      + ("" if t else " (out of view)"), flush=True)
+                continue
             if along <= args.hold_mm + args.tol_mm:
                 break
             adv = min(args.step_mm, along - args.hold_mm)
-            await go_rel(np.array([0.7 * rel[0], 0.7 * rel[1], adv]))
+            await go_rel(np.array([cap(rel[0]), cap(rel[1]), adv]))
             print(f"[C {cycle}] {along:.0f} mm along the axis, {lat:.0f} mm off to the side" + ("" if t else " (out of view)"), flush=True)
         else:
             raise SystemExit("did not reach the object within the cycle limit")
@@ -413,7 +423,12 @@ def main():
     ap.add_argument("--sink", choices=["sim", "viam"], default="sim", help="sim = dry run, nothing moves")
     ap.add_argument("--near-world", help="x,y,z (mm, world): start with the object nearest this point (to pick a particular one)")
     ap.add_argument("--looks", type=int, default=8, help="dry run: how many times to look (move the object to watch it follow)")
-    ap.add_argument("--standoff-mm", type=float, default=150.0, help="pre-grasp distance short of the object")
+    ap.add_argument("--standoff-mm", type=float, default=250.0, help="pre-grasp distance short of the object (the wrist is flattened here, "
+                    "well clear of it: the tip swings by several cm)")
+    ap.add_argument("--align-tol-mm", type=float, default=30.0, help="off-axis error above which it only aligns (no forward motion)")
+    ap.add_argument("--clearance-mm", type=float, default=120.0, help="stay at least this far ahead of the object while aligning")
+    ap.add_argument("--lat-step-mm", type=float, default=25.0, help="longest sideways correction per step")
+    ap.add_argument("--blind-lat-mm", type=float, default=80.0, help="refuse to correct more than this sideways when the object is out of view")
     ap.add_argument("--hold-mm", type=float, default=0.0, help="stop this far short of the object centre along the gripper axis")
     ap.add_argument("--step-mm", type=float, default=100.0, help="longest planned step (shorter = reacts faster to a moved object)")
     ap.add_argument("--tol-mm", type=float, default=30.0)
