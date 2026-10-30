@@ -261,6 +261,15 @@ async def main_async(args):
         ip = (await cam.get_properties()).intrinsic_parameters
         intr = {"fx": ip.focal_x_px, "fy": ip.focal_y_px, "cx": ip.center_x_px, "cy": ip.center_y_px, "w": ip.width_px, "h": ip.height_px}
         model, dargs = load_detector(args.object)
+        WRIST_HOME = (-86.05, 8.90, -272.49)                   # the reset pose's wrist (joints 4, 5, 6): the horizontal-ish rotations the pick starts from
+
+        async def start_joints():
+            """Current joints, but with the wrist (4, 5, 6) set to the reset pose's rotations: what the wrist returns to after the vertical sweep,
+            wherever the run itself began (it may begin in the sweep pose)."""
+            j = list((await arm.get_joint_positions()).values)
+            j[3:6] = list(WRIST_HOME)
+            return j
+
         home = list((await arm.get_joint_positions()).values)          # the ORIGINAL pose: where to come back to if a search pass finds nothing
         memory = ObjectMemory(args.memory_file, args.object)
         if args.use_memory and memory.load():
@@ -709,7 +718,7 @@ async def main_async(args):
         async def survey():
             """Look-around fallback (vertical gripper, wrist scan, joint sweep); once something is found the wrist goes back to the
             rotations the run started with (the horizontal / near-reset ones) before the approach."""
-            j_start = list((await arm.get_joint_positions()).values)
+            j_start = await start_joints()
             t = await _survey_inner()
             if not t:
                 return None
@@ -729,7 +738,7 @@ async def main_async(args):
             starting pose in --survey-step-deg steps out to +/- --survey-deg, record the nearest object at each stop, then go back to the
             stop where the nearest one was seen and lock on it. The memory is reset to that object."""
             say("initial sweep: looking around from the starting pose (object positions change, so always sweep first) ...", flush=True)
-            j_start = list((await arm.get_joint_positions()).values)   # the starting (horizontal / near-reset) rotations
+            j_start = await start_joints()                         # the wrist's horizontal-ish (reset) rotations to come back to
             await go_sweep_pose()                                 # FIRST: the saved top-down sweep pose, then sweep joint 2 around it
             j_here = list((await arm.get_joint_positions()).values)
             offsets = [0.0] + [a * sg for a in np.arange(args.survey_step_deg, args.survey_deg + 1e-6, args.survey_step_deg) for sg in (1.0, -1.0)]
