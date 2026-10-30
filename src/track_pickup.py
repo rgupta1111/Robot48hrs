@@ -96,7 +96,7 @@ def main():
         pass
     lock, flt = Lock(max_jump_frac=0.5, lost_after=10 ** 6), FeatureFilter(alpha=args.smooth_features, beta=0.0)
     flags = {"stop": False, "paused": False, "yes": None, "go": not args.ui}
-    view = {"frame": None, "text": "starting", "state": "starting", "aim": None}
+    view = {"frame": None, "text": "starting", "state": "starting", "aim": None, "cands": []}
     ui = None
 
     def confirm(question):
@@ -117,6 +117,8 @@ def main():
         if not ui or view["frame"] is None:
             return
         img, h = view["frame"].copy(), view["frame"].shape[0]
+        for c in view["cands"]:                             # every detection in grey, the locked one in green
+            cv2.rectangle(img, (int(c[0]), int(c[1])), (int(c[2]), int(c[3])), (160, 160, 160), 1)
         if lock.locked:
             b = [int(v) for v in lock.box]
             cv2.rectangle(img, (b[0], b[1]), (b[2], b[3]), (0, 200, 0), 3)
@@ -140,7 +142,9 @@ def main():
         if frame is None:
             return None, None, None
         view["frame"] = frame
-        lock.update(object_candidates(detect(model, frame, dargs), args.object), frame.shape[1])
+        cands = object_candidates(detect(model, frame, dargs), args.object)
+        view["cands"] = cands
+        lock.update(cands, frame.shape[1])
         if not lock.locked:
             return None, None, frame
         h, w = frame.shape[:2]
@@ -347,7 +351,8 @@ def main():
             show("arrived" if arrived else "tracking", f"offset u{s[0]:+.2f} v{s[1]:+.2f} aim v{target[1]:+.2f}"
                  + ("" if dist is None else f" {dist:.0f} cm"))
             print(f"[{cycle:3}] offset u{s[0]:+.2f} v{s[1]:+.2f} aim v{target[1]:+.2f}  "
-                  + ("" if dist is None else f"{dist:.0f} cm") + ("  ARRIVED" if arrived else ""), flush=True)
+                  + ("" if dist is None else f"{dist:.0f} cm") + f"  seen {len(view['cands'])}"
+                  + ("  ARRIVED" if arrived else ""), flush=True)
             if arrived:
                 if real:
                     grasp()
@@ -366,7 +371,12 @@ def main():
             move = servo_step(J, s, tgt, (0, 1, 2) if d_goal else (0, 1), args.gain, args.max_step)
             move = smooth_move(prev, move, args.smooth, args.max_speed * dt)
             prev = move
-            move_by(move)
+            try:
+                move_by(move)
+            except Exception as e:
+                if flags["stop"]:                        # 'stop' cancels the move in flight on purpose
+                    break
+                raise
         else:
             print("gave up: did not arrive within the cycle limit")
     except KeyboardInterrupt:
