@@ -64,3 +64,12 @@ def test_depth_to_points_backprojects_a_flat_wall():
     assert np.allclose(pts[:, 2], 1000.0) and abs(pts[:, 0].mean()) < 60 and len(pts) == 9 * 16
     far = depth_to_points(np.full((72, 128), 50.0), 100.0, 100.0, 64.0, 36.0)                # inside the blind zone: dropped
     assert len(far) == 0
+
+
+def test_box_is_one_cluster_not_the_neighbouring_object():
+    vm = VoxelMap()
+    for k in range(6):                                       # two cups 150 mm apart, both seen
+        pts = np.vstack([scene_points((550, 0), seed=k), scene_points((550, 150), seed=50 + k)])
+        vm.integrate(pts, ORIGIN)
+    c, dims = vm.object_box((550, 0, 60), radius_mm=300, min_z_mm=40)
+    assert dims[1] < 150 and abs(c[1]) < 70                  # around the first cup only; the second (y=150) is not merged in

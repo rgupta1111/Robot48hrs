@@ -40,6 +40,7 @@ from viam.services.motion import MotionClient  # noqa: E402
 
 from local_detect import Lock, detect, load_detector, object_candidates  # noqa: E402
 from mimic.ui import UIServer  # noqa: E402
+from mimic.voxelmap import VoxelMap, depth_to_points  # noqa: E402
 from mimic.size import box_depth_mm, height_from_depth, parse_viam_depth, width_from_depth  # noqa: E402
 
 
@@ -113,7 +114,7 @@ class Perceiver:
 
     def __init__(self, robot, camera_name, gripper_name, cam, intr, model, dargs, label, person_mm, aim_frac=0.5, memory=None):
         self.memory = memory
-        self.color, self.cands = None, []
+        self.color, self.cands, self.last_dmap = None, [], None
         self.aim_frac = aim_frac     # where along the object's height to aim: 0.5 = its middle, 0.85 = near the top (the neck of a bottle)
         self.robot, self.camera_name, self.gripper_name, self.cam, self.intr = robot, camera_name, gripper_name, cam, intr
         self.model, self.dargs, self.label, self.person_mm = model, dargs, label, person_mm
@@ -148,6 +149,7 @@ class Perceiver:
             return None
         h, w = color.shape[:2]
         dmap = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+        self.last_dmap = dmap                                 # for the voxel map
         dets = await asyncio.to_thread(detect, self.model, color, self.dargs)          # YOLO on the GPU
         person_close = False
         for d in dets:
@@ -402,6 +404,26 @@ async def main_async(args):
                                                                                            z=float(known_world[2]))), args.gripper)).pose
             return np.array([p.x, p.y, p.z])
 
+        vox = VoxelMap() if args.voxel else None
+
+        async def cam_to_world():
+            """The camera's pose in the world as (R, origin): the frame system maps the camera's origin and unit axes."""
+            async def pt(x, y, z):
+                p = (await robot.transform_pose(PoseInFrame(reference_frame=args.camera, pose=Pose(x=x, y=y, z=z)), "world")).pose
+                return np.array([p.x, p.y, p.z])
+            o = await pt(0, 0, 0)
+            return np.stack([await pt(1, 0, 0) - o, await pt(0, 1, 0) - o, await pt(0, 0, 1) - o], axis=1), o
+
+        async def vox_update():
+            """Fold the latest depth frame into the voxel map (rays carve free space, so an object a person moves is cleared and re-added)."""
+            if vox is None or eye.last_dmap is None:
+                return
+            h_, w_ = eye.last_dmap.shape[:2]
+            sx_, sy_ = w_ / intr["w"], h_ / intr["h"]
+            pts = depth_to_points(eye.last_dmap, intr["fx"] * sx_, intr["fy"] * sy_, intr["cx"] * sx_, intr["cy"] * sy_, stride=args.voxel_stride)
+            R_, o_ = await cam_to_world()
+            await asyncio.to_thread(vox.integrate, pts @ R_.T + o_, o_)
+
         async def object_obstacle(rel):
             """The object as a box obstacle for the planner, placed from the SAME gripper-frame measurement that drives the move (so the
             two always agree; the remembered world position can differ from it by ~10 cm). None if there is no measurement."""
@@ -410,8 +432,13 @@ async def main_async(args):
             wp = (await robot.transform_pose(PoseInFrame(reference_frame=args.gripper, pose=Pose(x=float(rel[0]), y=float(rel[1]),
                                                                                                  z=float(rel[2]))), "world")).pose
             wd, ht = memory.width or 90.0, memory.height or 220.0      # defaults when its size is not known (its box was clipped)
-            g = Geometry(center=Pose(x=wp.x, y=wp.y, z=wp.z), box=RectangularPrism(dims_mm=Vector3(x=wd + 10, y=wd + 10, z=ht + 10)),
-                         label=args.object)
+            centre, dims = np.array([wp.x, wp.y, wp.z]), np.array([wd + 10, wd + 10, ht + 10])
+            if vox is not None:                                       # the map's real extent of whatever stands there now, if it has seen it
+                box = vox.object_box(centre, radius_mm=250.0, min_z_mm=args.table_top_mm + 40.0)
+                if box is not None:
+                    centre, dims = box
+            g = Geometry(center=Pose(x=float(centre[0]), y=float(centre[1]), z=float(centre[2])),
+                         box=RectangularPrism(dims_mm=Vector3(x=float(dims[0]), y=float(dims[1]), z=float(dims[2]))), label=args.object)
             return WorldState(obstacles=[GeometriesInFrame(reference_frame="world", geometries=[g])])
 
         j6_ref = {"v": None}
@@ -457,6 +484,7 @@ async def main_async(args):
                 while flags["paused"] and not flags["stop"]:
                     await asyncio.sleep(0.2)
                 t = await eye.look()
+                await vox_update()
                 if t and t["person_close"]:
                     show("paused", "a person is close: waiting")
                     say("a person is close to the camera/gripper: waiting", flush=True)
@@ -839,6 +867,10 @@ async def main_async(args):
                 say(f"[look {i + 1}] no {args.object} seen", flush=True)
             await asyncio.sleep(0.5)
         hold = args.hold_mm if args.hold_mm is not None else args.tip_ahead_mm / 2.0
+        if vox is not None and tgt:
+            box = vox.object_box(tgt["world"], radius_mm=250.0, min_z_mm=args.table_top_mm + 40.0)
+            say(f"voxel map: {int((vox.L > 1.0).sum())} occupied voxels; " + ("nothing above the table near the object yet" if box is None else
+                f"object box near it: centre x{box[0][0]:.0f} y{box[0][1]:.0f} z{box[0][2]:.0f}, size {box[1][0]:.0f} x {box[1][1]:.0f} x {box[1][2]:.0f} mm"), flush=True)
         not_in_view = tgt is None
         known0 = (eye.expected if not_in_view else tgt["world"])      # None: nothing seen and nothing remembered
         if not_in_view and not real:
@@ -1039,6 +1071,10 @@ def main():
                     "sweeps the camera near/far over the table; 1 = base: left/right)")
     ap.add_argument("--survey-deg", type=float, default=20.0, help="initial look-around: sweep that joint out to +/- this many degrees")
     ap.add_argument("--survey-step-deg", type=float, default=10.0, help="initial look-around: base step between looks")
+    ap.add_argument("--voxel", action="store_true", help="build a live voxel map from the depth frames (it follows an object a person moves) and give the "
+                    "planner the cup's real extent from it as the obstacle")
+    ap.add_argument("--voxel-stride", type=int, default=8, help="--voxel: use every Nth depth pixel")
+    ap.add_argument("--table-top-mm", type=float, default=-23.0, help="--voxel: world height of the table top (the machine config's table box top)")
     ap.add_argument("--near-world", help="x,y,z (mm, world): start with the object nearest this point (to pick a particular one)")
     ap.add_argument("--looks", type=int, default=8, help="dry run: how many times to look (move the object to watch it follow)")
     ap.add_argument("--standoff-mm", type=float, default=250.0, help="pre-grasp distance short of the object (the wrist is flattened here, "

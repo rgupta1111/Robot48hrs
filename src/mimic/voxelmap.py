@@ -65,14 +65,34 @@ class VoxelMap:
         idx = np.argwhere(self.L > thresh)
         return self.lo + (idx + 0.5) * self.res
 
-    def object_box(self, near, radius_mm=250.0, min_z_mm=-100.0, thresh=1.0, min_voxels=3, margin_mm=15.0):
-        """Bounding box (centre, dims) of the occupied voxels within radius_mm of `near` and above min_z_mm (above the table), or None.
-        The planner's obstacle for the thing we are about to reach: its real extent, not a guessed box."""
-        c = self.occupied_centres(thresh)
-        if len(c) == 0:
+    def object_box(self, near, radius_mm=250.0, min_z_mm=-100.0, thresh=1.0, min_voxels=3, margin_mm=15.0, seed_mm=120.0):
+        """Bounding box (centre, dims) of the ONE connected cluster of occupied voxels that contains the occupied voxel nearest to `near`
+        (within seed_mm), considering only voxels above min_z_mm (above the table) and within radius_mm of `near`; or None. Neighbouring
+        objects are not merged in: the planner's obstacle for the thing we are about to reach is its real extent, not a guessed box."""
+        idx = np.argwhere(self.L > thresh)
+        if len(idx) == 0:
             return None
-        c = c[(np.linalg.norm(c - np.asarray(near, float), axis=1) <= radius_mm) & (c[:, 2] >= min_z_mm)]
-        if len(c) < min_voxels:
+        centres = self.lo + (idx + 0.5) * self.res
+        ok = (np.linalg.norm(centres - np.asarray(near, float), axis=1) <= radius_mm) & (centres[:, 2] >= min_z_mm)
+        idx, centres = idx[ok], centres[ok]
+        if len(idx) < min_voxels:
             return None
+        seed = int(np.argmin(np.linalg.norm(centres - np.asarray(near, float), axis=1)))
+        if np.linalg.norm(centres[seed] - np.asarray(near, float)) > seed_mm:
+            return None                                                   # nothing occupied right where the object should be
+        cells = {tuple(v): k for k, v in enumerate(idx)}
+        seen, stack = {tuple(idx[seed])}, [tuple(idx[seed])]
+        while stack:                                                      # 26-connected flood fill over the occupied voxels
+            x, y, z = stack.pop()
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for dz in (-1, 0, 1):
+                        n = (x + dx, y + dy, z + dz)
+                        if n in cells and n not in seen:
+                            seen.add(n)
+                            stack.append(n)
+        if len(seen) < min_voxels:
+            return None
+        c = centres[[cells[v] for v in seen]]
         lo, hi = c.min(axis=0) - self.res / 2 - margin_mm, c.max(axis=0) + self.res / 2 + margin_mm
         return (lo + hi) / 2, hi - lo
