@@ -46,9 +46,10 @@ def main():
     ap.add_argument("--table-z-mm", type=float, default=-123.0, help="table top height in the robot frame (the lab preset's)")
     ap.add_argument("--tool-length-mm", type=float, default=105.0, help="flange-to-fingertip length of the gripper")
     ap.add_argument("--table-margin-mm", type=float, default=30.0, help="keep the fingertips at least this far above the table")
-    ap.add_argument("--wrist-flat", action="store_true", help="at the grip distance, rotate ONLY the wrist pitch joint "
-                    "(--wrist-joint) until the gripper is flat, then close it (asks before each step)")
-    ap.add_argument("--wrist-joint", type=int, default=5, help="--wrist-flat: which joint pitches the wrist, numbered as in the Viam app (1-6)")
+    ap.add_argument("--wrist-flat", action="store_true", help="at the grip distance, rotate ONLY one wrist joint "
+                    "(--wrist-joint, default 4) until the gripper is flat, then close it (asks before each step)")
+    ap.add_argument("--wrist-joint", type=int, default=4, help="--wrist-flat: which joint flattens the gripper, numbered as in the Viam app (1-6); "
+                    "4 on this arm (not 5, and never 6, the final roll)")
     ap.add_argument("--wrist-deg", type=float, default=90.0, help="--wrist-flat: most it may rotate, in 10-degree steps")
     ap.add_argument("--wrist-sign", type=int, choices=[-1, 0, 1], default=0, help="--wrist-flat: which way (+1/-1); 0 = try both "
                     "with a 10-degree test and pick the one that flattens the gripper and points it forward")
