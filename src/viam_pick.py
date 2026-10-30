@@ -634,6 +634,22 @@ async def main_async(args):
             say("handed over.")
             show("done", "handed over")
 
+        async def set_roll():
+            """Set the final roll joint (--roll-joint, app numbering; 6) to the taught pick value (--roll-target-deg, about -360), which is
+            the roll the gripper had in the taught pick pose (jaws opening sideways). Small steps, other joints untouched."""
+            idx = args.roll_joint - 1
+            j = list((await arm.get_joint_positions()).values)
+            cur, target = j[idx], args.roll_target_deg
+            if abs(cur - target) <= args.roll_tol_deg:
+                say(f"joint {args.roll_joint} is already at {cur:.0f} deg (target {target:.0f}): roll unchanged", flush=True)
+                return
+            say(f"setting joint {args.roll_joint} (the gripper roll) from {cur:.0f} to {target:.0f} deg for the pick", flush=True)
+            while abs(j[idx] - target) > 1.0:
+                j[idx] += float(np.clip(target - j[idx], -15.0, 15.0))      # 15-degree steps toward the target
+                await arm.move_to_joint_positions(JointPositions(values=j))
+                check_stop()
+            say(f"joint {args.roll_joint} is now {(await arm.get_joint_positions()).values[idx]:.0f} deg", flush=True)
+
         async def orient_down():
             """Point the gripper straight DOWN (tool direction o_z -> -1) with ONE of the wrist joints (4 or 5, whichever points it further
             down; never 6), so the camera looks at the table below during the survey. The later flatten stage levels it for the grasp."""
@@ -857,6 +873,8 @@ async def main_async(args):
                 return
             await flatten()
 
+        await set_roll()                                          # the pick happens at the taught gripper roll (joint 6 near -360)
+
         # ---- stage C: advance along the gripper axis, correcting sideways, still re-planning ----
         show("advancing", "aligning and advancing onto the object")
         if not await confirm("ADVANCE along the gripper axis onto the object (re-planned every step), then CLOSE and lift."):
@@ -998,6 +1016,9 @@ def main():
                     "sits slightly outside the object, so the estimate reads wide (79 mm closed 1-2 mm too loose on the bottle). Negative = tighter")
     ap.add_argument("--wrist-joint", type=int, default=0, help="joint that flattens the gripper (Viam app numbering); 0 = try 4 and 5 and pick "
                     "the one that works from the current pose (never 6)")
+    ap.add_argument("--roll-joint", type=int, default=6, help="the final roll joint, Viam app numbering (6)")
+    ap.add_argument("--roll-target-deg", type=float, default=-358.0, help="roll joint angle for the pick: -360 in the taught pick pose (jaws sideways); -358 stays inside the joint limit")
+    ap.add_argument("--roll-tol-deg", type=float, default=10.0, help="leave the roll alone if it is already within this of the target")
     ap.add_argument("--wrist-deg", type=float, default=100.0)
     ap.add_argument("--peek-down-mm", type=float, default=20.0, help="when the object is out of view in the final stage, lower the gripper "
                     "in 10 mm steps by up to this much and look again (a level gripper looks straight ahead, over the object)")
