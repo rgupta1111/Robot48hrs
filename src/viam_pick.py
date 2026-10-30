@@ -125,6 +125,7 @@ class Perceiver:
     def __init__(self, robot, camera_name, gripper_name, cam, intr, model, dargs, label, person_mm, aim_frac=0.5, memory=None):
         self.memory = memory
         self.color, self.cands, self.last_dmap = None, [], None
+        self.stamp = 0.0                                  # when YOLO last looked (the live-view streamer fills the gaps between looks)
         self.dets, self.lock_info = [], ""      # every detection of the last frame (for the live view) and the locked object's size/depth text
         self.aim_frac = aim_frac     # where along the object's height to aim: 0.5 = its middle, 0.85 = near the top (the neck of a bottle)
         self.robot, self.camera_name, self.gripper_name, self.cam, self.intr = robot, camera_name, gripper_name, cam, intr
@@ -178,6 +179,7 @@ class Perceiver:
         person_close = self.person_hits >= 2                 # a one-frame flicker does not pause the arm
         cands = object_candidates(dets, self.label)
         self.color, self.cands, self.dets = color, list(cands), list(dets)          # for the web page's live view
+        self.stamp = time.monotonic()
         if not self.lock.locked:                         # (re)lock: the one nearest where it was; the first time, the nearest by depth
             scored = []
             for c in cands:
@@ -264,6 +266,8 @@ class Perceiver:
         h, w = color.shape[:2]
         dmap = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
         dets = await asyncio.to_thread(detect, self.model, color, self.dargs)
+        self.stamp = time.monotonic()
+        self.color, self.dets, self.cands = color, list(dets), []        # so the web page shows what the robot sees while it looks for people
         best = None
         for d in dets:
             if d[5] != "person" or d[4] < self.person_conf or (d[3] - d[1]) < self.person_min_px:
@@ -324,6 +328,7 @@ async def main_async(args):
         flags = {"stop": False, "paused": False, "yes": None, "go": not args.ui, "grip": False}
         view = {"text": "starting", "state": "starting", "dist": None}
         ui = None
+        streamer = {"task": None}
 
         runlog = RunLog(args)
         runlog.metric("width_mm", memory.width)
@@ -449,6 +454,21 @@ async def main_async(args):
                 await asyncio.sleep(0.15)
             view["question"], view["choices"] = None, None
             check_stop()
+
+            async def keep_streaming():
+                """The page's picture must never freeze: while the robot is busy (moving, closing, lifting, panning) and no YOLO look has run for a
+                moment, fetch the camera frame and redraw it with the last boxes and the current status (~5 fps)."""
+                while True:
+                    try:
+                        if time.monotonic() - eye.stamp > 0.4:
+                            for im in (await cam.get_images())[0]:
+                                if "dep" not in str(im.mime_type).lower():
+                                    eye.color = cv2.imdecode(np.frombuffer(im.data, np.uint8), cv2.IMREAD_COLOR)
+                            show(view["state"], view["text"], view["dist"])
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.2)
+            streamer["task"] = asyncio.ensure_future(keep_streaming())
 
         async def gripper_pose():
             return (await robot.transform_pose(PoseInFrame(reference_frame=args.gripper, pose=Pose()), "world")).pose
@@ -789,12 +809,14 @@ async def main_async(args):
                         w_ = await eye.person_world()
                         if w_ is not None and (best is None or np.hypot(w_[0], w_[1]) < np.hypot(best[0], best[1])):
                             best = w_
+                    show("scanning", f"looking for a person: base {off:+.0f} deg" + (" - found" if best is not None else ""))
                     say(f"  scan base {off:+.0f} deg: " + (f"person at {np.hypot(best[0], best[1]) / 10:.0f} cm from the base" if best is not None else "nobody"), flush=True)
                     if best is not None:
                         seen_people.append((float(np.hypot(best[0], best[1])), off, best))
                 if not seen_people:
                     await arm.move_to_joint_positions(JointPositions(values=j0))
                     return None
+                show("scanning", "going to the closest person")
                 dist_, off_, found = min(seen_people, key=lambda x: x[0])
                 say(f"  closest person: {dist_ / 10:.0f} cm from the base (base {off_:+.0f} deg): handing it to them", flush=True)
                 j = list(j0)
@@ -809,6 +831,7 @@ async def main_async(args):
 
         async def return_to_start():
             """After the hand-over: wait for the person to step clear, then go back to the reset pose slowly, ready for the next pick."""
+            show("returning", "handed over: stand clear, returning to the start pose")
             await asyncio.sleep(args.clear_s)
             try:
                 await arm.do_command({"set_speed": float(args.handover_speed_dps)})
@@ -853,7 +876,7 @@ async def main_async(args):
                 await asyncio.sleep(2.0)                               # let the arm settle, then read the baseline load
                 base = np.array((await arm.do_command({"load": ""})).get("load", [0.0] * 6), float)
                 flags["yes"] = None
-                t0, since, taken, told = time.monotonic(), None, False, False
+                t0, since, taken, told, last_view = time.monotonic(), None, False, False, 0.0
                 view["question"] = f"Release the {eye.label} to the person?"
                 view["choices"] = [{"label": "Yes, release", "send": "yes"}, {"label": "No, keep holding", "send": "no"}]
                 try:
@@ -865,6 +888,10 @@ async def main_async(args):
                         if flags["yes"] is False:
                             flags["yes"] = None                         # 'no': keep holding and keep asking
                             say("OK, still holding it.")
+                        if time.monotonic() - last_view > 0.7:             # keep the page alive while holding it out
+                            await eye.person_world()
+                            show("handover", f"holding the {eye.label} out: press Yes to release ({args.handover_wait_s - (time.monotonic() - t0):.0f} s left)")
+                            last_view = time.monotonic()
                         load = np.array((await arm.do_command({"load": ""})).get("load", [0.0] * 6), float)
                         if float(np.max(np.abs(load - base))) > args.pull_load:
                             since = since or time.monotonic()
@@ -1321,6 +1348,8 @@ async def main_async(args):
                 await return_to_start()
         await asyncio.sleep(2.0)
     finally:
+        if streamer["task"]:
+            streamer["task"].cancel()
         try:
             memory.save()
         except Exception:
