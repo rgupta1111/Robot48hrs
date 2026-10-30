@@ -41,9 +41,22 @@ def test_controls():
 
 def test_empty_and_unknown():
     assert intent("   ") == "empty"
-    assert intent("go") == "unknown"
+    assert intent("to the") == "unknown"
     assert intent("the") == "unknown"
 
 
 def test_long_sentences_are_not_objects():
     assert intent("how about you tell me a really long story about robots") == "unknown"
+
+
+def test_gripper():
+    assert parse("open the gripper") == {"intent": "gripper", "open": True}
+    assert parse("close the gripper please") == {"intent": "gripper", "open": False}
+
+
+def test_settings_and_calibration():
+    assert parse("fingertips are 13 cm in front of the camera") == {"intent": "set", "key": "tip_offset_mm", "value": 130.0}
+    assert parse("the cup is 9 cm tall") == {"intent": "set", "key": "object_height_mm", "value": 90.0}
+    assert parse("calibrate 30 cm") == {"intent": "calibrate", "cm": 30.0}
+    assert parse("the cup is 25 cm away") == {"intent": "calibrate", "cm": 25.0}
+    assert intent("go") == "yes" and intent("execute the plan") == "yes"

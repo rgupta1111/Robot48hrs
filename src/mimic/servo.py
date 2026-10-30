@@ -60,3 +60,15 @@ class FeatureFilter:
     def predict(self, ahead_s):
         """Where the features will be ahead_s seconds after the last update."""
         return self.x + self.v * ahead_s
+
+
+def depth_direction(J):
+    """Unit vector in robot axes that moves the object toward the camera (its image grows) WITHOUT shifting it in the
+    image - the 'forward' of the camera, learned from J. None if the learned response has no depth component."""
+    J = np.asarray(J, float)
+    _, _, vt = np.linalg.svd(J[:2])
+    n = vt[-1]                                  # null space of the u, v rows: motion that leaves the image position alone
+    g = float(J[2] @ n)
+    if abs(g) < 1e-6:
+        return None
+    return n if g > 0 else -n

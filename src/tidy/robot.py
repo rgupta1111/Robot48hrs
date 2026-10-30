@@ -45,6 +45,7 @@ class ViamRobot:
         self.table = table_to_world or TableToWorld()
         self.workspace, self.max_z_mm = workspace, max_z_mm
         self.allow_collisions = allow_collisions or []
+        self.use_planner = False     # True: moves go through Viam's motion service, which plans around the world's obstacles
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
         self._thread.start()
@@ -91,6 +92,19 @@ class ViamRobot:
         from viam.components.arm import JointPositions
         self._run(self.arm.move_to_joint_positions(JointPositions(values=list(values))))
 
+    def get_kinematics(self):
+        """The arm's kinematics file as bytes (Viam SVA JSON for most arms)."""
+        return self._run(self.arm.get_kinematics())[1]
+
+    def move_through_joints(self, waypoints_deg, max_vel_degs=None, max_acc_degs=None, wait=True):
+        """One smooth trajectory through all the joint waypoints (Viam MoveThroughJointPositions), with optional
+        joint speed / acceleration limits. wait=False returns a future."""
+        from viam.components.arm import JointPositions, MoveOptions
+        opts = MoveOptions(max_vel_degs_per_sec=max_vel_degs or 0.0, max_acc_degs_per_sec2=max_acc_degs or 0.0)
+        positions = [JointPositions(values=[float(v) for v in q]) for q in waypoints_deg]
+        fut = asyncio.run_coroutine_threadsafe(self.arm.move_through_joint_positions(positions, options=opts), self._loop)
+        return fut.result(300) if wait else fut
+
     def is_moving(self):
         return bool(self._run(self.arm.is_moving()))
 
@@ -107,20 +121,23 @@ class ViamRobot:
         tilt = math.radians(tilt_deg)
         pose = Pose(x=wx, y=wy, z=wz, o_x=math.sin(tilt), o_y=0.0, o_z=-math.cos(tilt),
                     theta=yaw_deg + self.table.yaw_deg)
-        if self.allow_collisions:
+        if self.allow_collisions or self.use_planner:
             self._run(self._motion_move(pose))
         else:
             self._run(self.arm.move_to_position(pose))
 
     async def _motion_move(self, pose):
+        """Plan and execute with Viam's motion service: it knows the obstacles in the machine's frame system
+        (table, walls, ...) and the arm's own links, and refuses paths that would collide."""
         from viam.proto.common import PoseInFrame
         from viam.proto.service.motion import CollisionSpecification, Constraints
         from viam.services.motion import MotionClient
-        allowed = [CollisionSpecification.AllowedFrameCollisions(frame1=a, frame2=b) for a, b in self.allow_collisions]
-        constraints = Constraints(collision_specification=[CollisionSpecification(allows=allowed)])
-        motion = MotionClient.from_robot(self._robot, "builtin")
-        await motion.move(self.arm.get_resource_name(self.arm_name), PoseInFrame(reference_frame="world", pose=pose),
-                          constraints=constraints)
+        constraints = None
+        if self.allow_collisions:
+            allowed = [CollisionSpecification.AllowedFrameCollisions(frame1=a, frame2=b) for a, b in self.allow_collisions]
+            constraints = Constraints(collision_specification=[CollisionSpecification(allows=allowed)])
+        motion = MotionClient("builtin", self._robot._channel)
+        await motion.move(self.arm_name, PoseInFrame(reference_frame="world", pose=pose), constraints=constraints)
 
     def move_xyz(self, x, y, z, wait=True):
         """Move the tool to (x, y, z) mm in the robot frame KEEPING its current orientation (so a camera mounted on
@@ -136,7 +153,7 @@ class ViamRobot:
         self._orient = cur
         wx, wy, wz = self.table.apply(x, y, z)
         pose = Pose(x=wx, y=wy, z=wz, o_x=cur.o_x, o_y=cur.o_y, o_z=cur.o_z, theta=cur.theta)
-        coro = self._motion_move(pose) if self.allow_collisions else self.arm.move_to_position(pose)
+        coro = self._motion_move(pose) if (self.allow_collisions or self.use_planner) else self.arm.move_to_position(pose)
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return fut.result(120) if wait else fut
 

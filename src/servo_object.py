@@ -1,39 +1,33 @@
-"""Camera-on-gripper visual servoing: move the gripper so the cup stays CENTRED in the camera image.
+"""Find the object, CENTRE it, PLAN a straight approach, show the plan, EXECUTE it as one smooth motion.
 
-Closed loop (pipelined, so it runs as fast as the camera allows):
-    camera grabbers (several requests in flight) -> detector thread (light YOLO, every new frame) -> control loop
-    -> gripper move on its own thread -> next frame ... The screen shows the live camera / detector fps.
+    1. centre   small camera-guided steps until the object sits in the middle of the image (the camera response J is
+                learned once by three small probe moves, so any camera mounting works)
+    2. plan     measure the distance, then build a straight line along the camera axis to the stop distance:
+                  fast until --slow-below-cm (5 cm), easing to a crawl, gripper opens at --open-at-cm (10 cm),
+                  stop at --stop-distance-mm (10 mm = 1 cm).  Distances are gripper-to-object: camera estimate minus
+                  --tip-offset-mm (camera-to-fingertip distance - set it, or distances are camera-to-object!)
+                The line is solved in JOINT space from the arm's own Viam kinematics, each waypoint seeded from the
+                last, so joint movement is minimal (checked against the live Viam pose; falls back to Cartesian moves).
+                The plan is checked against the table / walls (machine frame system, or the built-in lab world) with
+                --margin-mm clearance and --obstacle boxes, and printed in the chat / on the page before it runs.
+    3. execute  one MoveThroughJointPositions trajectory per leg (fast, slow) at the planned speed; the gripper opens
+                when the arm's real Viam pose passes the planned point. After the fast leg the object is re-measured
+                and the plan is rebuilt if reality differs from the plan.
+    --planner   uses Viam's collision-planning motion service for the centring moves too.
 
-How the image offset turns into robot motion is LEARNED, not assumed: at engage the arm makes three small probe
-moves (along x, y, z, then back) and watches how the cup shifts, giving the matrix J (see mimic/servo.py). That
-covers however the camera is mounted. The tool orientation is never changed, so the camera keeps its view.
-If the cup leaves the picture it keeps moving toward where it was last seen (a few steps), then holds.
-
-    scripts/run.sh src/servo_object.py --viam-address <machine>.viam.cloud --preset lab --lock cup            # dry run
-    scripts/run.sh src/servo_object.py --viam-address <machine>.viam.cloud --preset lab --lock cup --sink viam
-Keys (click the window): space engage/disengage, p re-probe, c calibrate distance, t teach stop distance, x e-stop, l unlock, r re-acquire,
-click a box to lock it, q / Esc quit.  Dry run (--sink sim) sends nothing to the arm.
-Chat UI (--ui): open a local web page with the live camera view and a chat box. Type what to go to ("go to the cup",
-"lock on the bottle", "get within 5 cm of the cup"), or stop / pause / resume / unlock / reset / "what do you see".
-The arm only moves while engaged; STOP and the word "stop" always halt it. Add --sink viam for the real arm.
-    scripts/run.sh src/servo_object.py --viam-address <machine>.viam.cloud --preset lab --ui --sink viam
-Distance: the camera-to-object distance is estimated from the object's size on screen (pinhole model) and shown on
-the video; give the true height with --object-height-mm, or hold the object at a known distance and press c
-(--calib-cm) to calibrate.  Approach (default; --no-approach turns it off): once the cup is centred, the gripper moves
-toward it (--approach-speed) until the estimated distance is under --stop-distance-mm (default 100 = 10 cm), then
-holds. Press t with the gripper at the distance you want to teach a different stop distance. There is NO contact
-sensor: the stop distance and the workspace bounds are the only safeguards, so keep a hand on the e-stop.
-Smooth motion: detections are filtered and the cup's image velocity is estimated so the arm aims slightly AHEAD
-(--lead); successive moves are blended (--smooth); --preempt sends the next move before the previous one finishes
-(the arm retargets without stopping) and subtracts moves that the camera has not shown yet (--lag).
-Speed: the camera is read over the network. If "cam" fps stays low, raise --workers, connect on the local network
-address, or lower the camera's resolution in the Viam config; the detector fps is shown separately.
+    scripts/run.sh src/servo_object.py --viam-address <machine>.viam.cloud --preset lab --ui --tip-offset-mm 130   # dry run
+    ... --sink viam                                                                                              # real arm
+Chat (--ui): "go to the cup", "get within 5 cm of the cup", "fingertips are 13 cm in front of the camera", "the cup is 9 cm
+tall", "calibrate 30 cm", yes / stop / pause / resume / unlock / reset / open the gripper / "what do you see".
+Keys in the video window: space start, p re-probe, c calibrate, t teach stop distance, x e-stop, l unlock, r re-acquire.
+There is NO contact sensor and the distance comes from the object's size on screen: keep a hand on the e-stop.
 """
 import argparse
 import json
 import os
 import queue
 import sys
+import threading
 import time
 import webbrowser
 
@@ -45,8 +39,11 @@ from arm_mimic import PRESETS, floats  # noqa: E402
 from local_detect import (COLORS, Lock, Range, color_candidates, crop_gray, detect, draw_lock,  # noqa: E402
                           load_detector, object_candidates, roi_candidates, template_candidates)
 from mimic.chat import HELP, parse  # noqa: E402
-from mimic.pipeline import FrameGrabber, MoveWorker, Perception  # noqa: E402
-from mimic.servo import FeatureFilter, estimate_jacobian, features, servo_step  # noqa: E402
+from mimic.kinematics import load_validated  # noqa: E402
+from mimic.pipeline import FrameGrabber, Perception  # noqa: E402
+from mimic.plan import attach_joints, build_plan, describe, segment_joint_speed  # noqa: E402
+from mimic.safety import Obstacles  # noqa: E402
+from mimic.servo import FeatureFilter, depth_direction, estimate_jacobian, features, servo_step  # noqa: E402
 from mimic.ui import UIServer  # noqa: E402
 from reset_position import RESET_JOINTS  # noqa: E402
 from tidy.robot import TableToWorld, ViamRobot  # noqa: E402
@@ -56,6 +53,10 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 JAC_FILE = os.path.abspath(os.path.join(ROOT, "data", "servo_jacobian.json"))
 # only used by the dry run when no probe has been done: image right/down -> gripper -y / -x, a guess
 GUESS_J = np.array([[0.0, -0.003, 0.0], [-0.003, 0.0, 0.0], [0.0, 0.0, 0.0008]])
+
+
+class Abort(Exception):
+    pass
 
 
 def main():
@@ -71,48 +72,57 @@ def main():
     ap.add_argument("--viam-insecure", action="store_true")
     ap.add_argument("--sink", choices=["sim", "viam"], default="sim", help="sim = dry run, nothing moves")
     ap.add_argument("--table-to-world", default="0,0,0,0")
-    ap.add_argument("--lock", default="cup", metavar="NAME", help="object to keep centred (default cup)")
-    ap.add_argument("--lock-color", choices=sorted(COLORS), help="optional: centre a colour blob instead")
+    ap.add_argument("--lock", default="cup", metavar="NAME", help="object to go to (default cup)")
+    ap.add_argument("--lock-color", choices=sorted(COLORS), help="optional: use a colour blob instead")
     ap.add_argument("--lock-min-area", type=float, default=400)
     ap.add_argument("--model", help="YOLO weights (default: yolov8s)")
     ap.add_argument("--prompts")
     ap.add_argument("--conf", type=float)
-    ap.add_argument("--imgsz", type=int, default=960, help="detector input size (smaller = faster, but misses small/far cups)")
-    ap.add_argument("--workers", type=int, default=4, help="overlapping camera requests (more = higher frame rate)")
-    ap.add_argument("--rate", type=float, default=15.0, help="control loop rate limit, Hz")
-    ap.add_argument("--hold-size", type=float, metavar="FRAC",
-                    help="also keep the cup this fraction of the frame height (e.g. 0.3): moves closer/farther")
-    ap.add_argument("--gain", type=float, default=0.8, help="fraction of the error corrected per move")
-    ap.add_argument("--max-step", type=float, default=60.0, help="largest single move, mm")
-    ap.add_argument("--max-speed", type=float, default=400.0, help="gripper speed limit, mm/s")
-    ap.add_argument("--deadband", type=float, default=0.03, help="stop moving when centred within this fraction of the frame")
-    ap.add_argument("--latency", type=float, default=0.05, help="extra seconds to wait after a move before trusting a frame")
-    ap.add_argument("--smooth", type=float, default=0.2, help="0..1 blend with the previous move (higher = smoother, laggier)")
-    ap.add_argument("--lead", type=float, default=0.15, help="extra seconds to aim ahead of the cup's image motion")
-    ap.add_argument("--preempt", action="store_true",
-                    help="keep moving: send the next move before the last one ends (try it; turn off if the arm complains)")
-    ap.add_argument("--lag", type=float, default=0.4, help="--preempt: seconds before a move shows up in the camera image")
-    ap.add_argument("--no-approach", action="store_true", help="only keep the object centred; do not move toward it")
-    ap.add_argument("--touch", action="store_true", help=argparse.SUPPRESS)   # old name: approaching is now the default
-    ap.add_argument("--stop-distance-mm", type=float, default=100.0, help="stop moving forward at this camera-to-object distance")
-    ap.add_argument("--approach-speed", type=float, default=80.0, help="closing speed while approaching, mm/s")
+    ap.add_argument("--imgsz", type=int, default=960, help="detector input size")
+    ap.add_argument("--workers", type=int, default=4, help="overlapping camera requests")
+    # --- approach profile
+    ap.add_argument("--stop-distance-mm", type=float, default=10.0, help="stop at this gripper-to-object distance (10 = 1 cm)")
+    ap.add_argument("--slow-below-cm", type=float, default=5.0, help="fast until this far, then ease down")
+    ap.add_argument("--open-at-cm", type=float, default=10.0, help="open the gripper at this distance")
+    ap.add_argument("--fast-speed", type=float, default=150.0, help="tool speed while far, mm/s")
+    ap.add_argument("--slow-speed", type=float, default=20.0, help="tool speed near the stop distance, mm/s")
+    ap.add_argument("--tip-offset-mm", type=float, default=0.0,
+                    help="distance from the camera to the fingertips along the viewing direction (0 = measure from the camera)")
     ap.add_argument("--object-height-mm", type=float, default=100.0, help="true height of the object (for distance)")
     ap.add_argument("--hfov", type=float, default=70.0, help="camera horizontal field of view in degrees, if unknown")
     ap.add_argument("--calib-cm", type=float, default=30.0, help="press c with the object this far from the camera")
+    # --- centring / plan / execution
+    ap.add_argument("--gain", type=float, default=0.8, help="fraction of the centring error corrected per step")
+    ap.add_argument("--max-step", type=float, default=60.0, help="largest centring step, mm")
+    ap.add_argument("--deadband", type=float, default=0.03, help="centred when within this fraction of the frame")
+    ap.add_argument("--stable-frames", type=int, default=4, help="centred frames in a row before planning")
+    ap.add_argument("--settle", type=float, default=0.35, help="seconds to wait after a move before trusting a frame")
+    ap.add_argument("--centre-timeout", type=float, default=40.0)
+    ap.add_argument("--plan-step-mm", type=float, default=10.0, help="waypoint spacing of the plan")
+    ap.add_argument("--max-travel-mm", type=float, default=400.0)
+    ap.add_argument("--max-joint-jump", type=float, default=15.0, help="largest joint change between waypoints, deg")
+    ap.add_argument("--joint-accel", type=float, default=3.0, help="joint acceleration limit = this x the leg's joint speed, per s")
+    ap.add_argument("--no-joint-space", action="store_true", help="skip the kinematics and use Cartesian moves")
+    ap.add_argument("--confirm-plan", action="store_true", help="wait for 'yes' before executing the plan")
+    ap.add_argument("--countdown", type=float, default=3.0, help="seconds between showing the plan and executing it")
+    ap.add_argument("--replans", type=int, default=3)
     ap.add_argument("--probe-mm", type=float, default=20.0, help="size of the learning moves")
     ap.add_argument("--probe", action="store_true", help="re-learn the camera response even if a saved one exists")
-    ap.add_argument("--search-steps", type=int, default=5, help="moves toward where the cup vanished before holding")
+    # --- obstacles
     ap.add_argument("--bounds", default="250,600,-300,300,0,450")
+    ap.add_argument("--margin-mm", type=float, default=60.0, help="clearance kept from obstacles")
+    ap.add_argument("--obstacle", action="append", default=[], metavar="XMIN,XMAX,YMIN,YMAX,ZMIN,ZMAX",
+                    help="extra keep-out box in the robot frame (repeatable)")
+    ap.add_argument("--no-world-obstacles", action="store_true", help="do not load the machine's table/walls")
+    ap.add_argument("--planner", action="store_true", help="send the centring moves through Viam's collision-planning motion service")
     ap.add_argument("--ui", action="store_true", help="serve the chat page on http://127.0.0.1:PORT/ and open it")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-browser", action="store_true", help="with --ui: do not open the page automatically")
-    ap.add_argument("--auto-engage", action="store_true")
+    ap.add_argument("--auto-engage", action="store_true", help="start the mission for --lock right away")
     ap.add_argument("--no-display", action="store_true")
-    ap.add_argument("--max-frames", type=int, default=0)
     if preset:
         ap.set_defaults(bounds=PRESETS[preset]["bounds"])
     args = ap.parse_args()
-    args.touch = not args.no_approach
     bounds = floats(args.bounds)
     lo, hi = np.array(bounds[0::2]), np.array(bounds[1::2])
     real = args.sink == "viam"
@@ -123,19 +133,43 @@ def main():
                                                    standard="yolov8s.pt")
     robot = ViamRobot(args.viam_address, args.arm_name, args.gripper_name, None, TableToWorld(*floats(args.table_to_world)),
                       workspace=bounds[:4], max_z_mm=bounds[5], insecure=args.viam_insecure)
-    lock = Lock(max_jump_frac=0.5, lost_after=10 ** 6)   # the picture jumps when the gripper moves; loss is handled below
-    J = None
-    if os.path.exists(JAC_FILE) and not args.probe:
-        J = np.array(json.load(open(JAC_FILE))["J"])
-        print("loaded the saved camera response from", JAC_FILE)
-    feats = (0, 1, 2) if args.hold_size else (0, 1)
-    target = np.array([0.0, 0.0, args.hold_size or 0.0])
-    click = {}
+    robot.use_planner = args.planner
+    lock = Lock(max_jump_frac=0.5, lost_after=10 ** 6)
 
     def current():
         p = robot.get_pose()
         return np.array(robot.table.to_robot(p.x, p.y, p.z))
 
+    shared = {"cur": current(), "alive": True}
+    if args.tip_offset_mm == 0:
+        print("note: --tip-offset-mm is 0, so the 10 cm / 1 cm distances are measured from the CAMERA, not the fingertips. "
+              "Measure camera-to-fingertip distance and pass it (or tell the chat: fingertips are 13 cm in front of the camera).",
+              flush=True)
+
+    # ---- obstacles ------------------------------------------------------------------------------------------------
+    obs = Obstacles(margin_mm=args.margin_mm)
+    if not args.no_world_obstacles:
+        obs, loaded, notes = Obstacles.from_viam(robot, args.margin_mm, skip_names=(args.arm_name, args.gripper_name))
+        if not loaded and preset == "lab":
+            obs, loaded = Obstacles.lab_world(args.margin_mm), ["built-in lab world: table, walls, ceiling"]
+        print("obstacles:", ", ".join(loaded) or "none loaded", flush=True)
+        for n_ in notes:
+            print("  note:", n_, flush=True)
+    for spec in args.obstacle:
+        obs.add(floats(spec), "custom")
+    inside = obs.blocking(shared["cur"])
+    if inside:
+        print("warning: the arm starts inside the keep-out margin of", [b.name for b in inside],
+              "- dropping those so it can move out", flush=True)
+        obs.boxes = [b for b in obs.boxes if b not in inside]
+
+    J = None
+    if os.path.exists(JAC_FILE) and not args.probe:
+        J = np.array(json.load(open(JAC_FILE))["J"])
+        print("loaded the saved camera response from", JAC_FILE)
+    ddir = depth_direction(J) if J is not None else None
+    target = np.zeros(3)
+    click = {}
     memo = {"template": None, "how": "detector"}
 
     def analyse(frame):
@@ -158,71 +192,24 @@ def main():
         h, w = frame.shape[:2]
         live = lock.update(cands, w)
         if live and memo["how"] == "detector":
-            memo["template"] = crop_gray(frame, lock.box)      # what the object looks like, for the fallback
+            memo["template"] = crop_gray(frame, lock.box)
         return dict(feats=features(lock.box, w, h) if live else None, live=live, dets=dets)
 
-    def do_move(job):
-        """Runs on the move thread: relative move from where the gripper is now."""
-        if real:
-            cur = current()
-            robot.move_xyz(*np.clip(cur + job, lo, hi))
-        shared["cur"] = current()
-
     robot.get_frame(args.camera)                      # create the camera client before threads share it
-    shared = {"cur": current()}
     grabber = FrameGrabber(lambda: robot.get_frame(args.camera), args.workers).start()
     perc = Perception(grabber, analyse)
     perc.start()
-    worker = MoveWorker(do_move)
-    worker.start()
 
-    def wait_result(after, timeout=8.0):
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout:
-            r = perc.result
-            if r is not None and r.t > after:
-                return r
-            time.sleep(0.01)
-        return None
+    if real:
+        def pose_loop():                               # the arm's real Viam pose, a few times a second
+            while shared["alive"]:
+                try:
+                    shared["cur"] = current()
+                except Exception:
+                    pass
+                time.sleep(0.1)
+        threading.Thread(target=pose_loop, daemon=True).start()
 
-    def move_and_wait(pos):
-        robot.move_xyz(*pos)
-        shared["cur"] = current()
-        return time.monotonic() + args.latency
-
-    def probe():
-        """Learn J: nudge the gripper along x, y, z and watch how the cup moves in the image."""
-        print("probing: three small moves, keep the cup in view ...", flush=True)
-        r0 = wait_result(time.monotonic())
-        if r0 is None or r0.feats is None:
-            print("probe aborted: cup not visible", flush=True)
-            return None
-        s0, p0, after, deltas = r0.feats, current(), [], []
-        for i in range(3):
-            tgt = p0.copy()
-            d = args.probe_mm if p0[i] + args.probe_mm <= hi[i] else -args.probe_mm
-            tgt[i] += d
-            r = wait_result(move_and_wait(tgt))
-            s = None if r is None else r.feats
-            move_and_wait(p0)
-            if s is None:
-                print(f"probe aborted: cup left the view when moving axis {'xyz'[i]}", flush=True)
-                return None
-            after.append(s)
-            deltas.append(d)
-        wait_result(time.monotonic() + args.latency)
-        Jn = estimate_jacobian(s0, after, deltas)
-        os.makedirs(os.path.dirname(JAC_FILE), exist_ok=True)
-        json.dump({"J": Jn.tolist(), "probe_mm": args.probe_mm}, open(JAC_FILE, "w"), indent=2)
-        print("learned camera response J (frame fraction per mm; rows u, v, h; columns x, y, z):\n", np.round(Jn, 5), flush=True)
-        return Jn
-
-    show = not args.no_display
-    if show:
-        cv2.namedWindow(WIN)
-        cv2.setMouseCallback(WIN, lambda e, x, y, f, p: click.update(pt=(x, y)) if e == cv2.EVENT_LBUTTONDOWN else None)
-    engaged, status, last_s, lost_n, last_used, last_tick, n = args.auto_engage, "idle", None, 0, 0.0, 0.0, 0
-    err_txt, last_print = "", 0.0
     rng = Range(args.object_height_mm, args.hfov)
     try:  # use the camera's own focal length when the machine reports it
         _, intr = robot.camera_info(args.camera)
@@ -230,12 +217,376 @@ def main():
             rng.focal_px, rng.focal_w = intr["fx"], intr["w"]
     except Exception:
         pass
-    dist_cm, stop_cm, touching = None, args.stop_distance_mm / 10.0, False
-    flt, flt_t, misses, prev_move, hist, futs = FeatureFilter(), 0.0, 0, np.zeros(3), [], []
-    cmd_pos = shared["cur"].copy()
+    cfg = {"tip_off_cm": args.tip_offset_mm / 10.0, "stop_cm": args.stop_distance_mm / 10.0,
+           "open_cm": args.open_at_cm, "slow_cm": args.slow_below_cm}
 
-    # ---- chat UI -------------------------------------------------------------------------------------------
-    cmdq, ui, info, pending, coco = queue.Queue(), None, {}, {"confirm": None}, {}
+    # ---- shared state between the display loop and the mission thread -----------------------------------------------
+    mu = threading.Lock()
+    snap = {"x": None, "t": 0.0, "tip": None, "dist": None, "clipped": False, "hpx": None}
+    S = {"phase": "idle", "detail": "", "plan": [], "abort": threading.Event(), "confirm": threading.Event(),
+         "waiting": False, "opened": False, "thread": None, "progress": None}
+    kin_cache = {}
+
+    def snapshot():
+        with mu:
+            return dict(snap)
+
+    def check():
+        if S["abort"].is_set():
+            raise Abort()
+
+    def say(text):
+        print("robot:", text, flush=True)
+        if ui:
+            ui.say(text)
+
+    def set_gripper(open_):
+        if real:
+            threading.Thread(target=lambda: robot.set_gripper(open_), daemon=True).start()
+
+    def wait_fresh(after, timeout):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            check()
+            sn = snapshot()
+            if sn["x"] is not None and sn["t"] > after:
+                return sn
+            time.sleep(0.02)
+        return None
+
+    def wait_result(after, timeout=8.0):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            check()
+            r_ = perc.result
+            if r_ is not None and r_.t > after:
+                return r_
+            time.sleep(0.01)
+        return None
+
+    def move_blocking(pos):
+        """Move there and wait (real arm), or just pretend (dry run)."""
+        if real:
+            robot.move_xyz(*pos)
+            shared["cur"] = current()
+        else:
+            shared["cur"] = np.array(pos, float)
+        return time.monotonic()
+
+    def probe():
+        """Learn J: nudge the gripper along x, y, z and watch how the object moves in the image."""
+        say("Learning the camera response with three small moves (keep the object in view) ...")
+        r0 = wait_result(time.monotonic())
+        if r0 is None or r0.feats is None:
+            say("I can't see the object, so I can't learn the camera response.")
+            return None
+        s0, p0, after, deltas = r0.feats, current(), [], []
+        for i in range(3):
+            tgt = p0.copy()
+            d = args.probe_mm if p0[i] + args.probe_mm <= hi[i] else -args.probe_mm
+            tgt[i] += d
+            tgt = np.clip(tgt, np.minimum(lo, p0), np.maximum(hi, p0))
+            safe, hit = obs.constrain(p0, tgt)
+            if hit:
+                say(f"The learning move along {'xyz'[i]} would enter {hit}; move the arm clear and try again.")
+                return None
+            r_ = wait_result(move_blocking(safe) + 0.3)
+            s_ = None if r_ is None else r_.feats
+            move_blocking(p0)
+            if s_ is None:
+                say(f"The object left the view when moving along {'xyz'[i]}.")
+                return None
+            after.append(s_)
+            deltas.append(float(safe[i] - p0[i]) or d)
+        wait_result(time.monotonic() + 0.3)
+        Jn = estimate_jacobian(s0, after, deltas)
+        os.makedirs(os.path.dirname(JAC_FILE), exist_ok=True)
+        json.dump({"J": Jn.tolist(), "probe_mm": args.probe_mm}, open(JAC_FILE, "w"), indent=2)
+        print("learned camera response J (frame fraction per mm; rows u, v, h; columns x, y, z):\n", np.round(Jn, 5), flush=True)
+        return Jn
+
+    # ---- mission: centre -> plan -> execute -----------------------------------------------------------------------
+    def centre():
+        """Camera-guided steps until the object has sat in the middle for --stable-frames frames."""
+        S.update(phase="centring", detail="")
+        last_end, t0, stable, lost = time.monotonic(), time.monotonic(), 0, 0
+        steps = 0
+        while True:
+            check()
+            if time.monotonic() - t0 > args.centre_timeout:
+                say("I couldn't centre the object in time. Stopping.")
+                return False
+            sn = wait_fresh(last_end + args.settle, 2.0)
+            if sn is None:
+                lost += 1
+                if lost >= 3:
+                    say(f"I lost sight of the {det['name']} while centring. Stopping.")
+                    return False
+                continue
+            lost = 0
+            s = sn["x"]
+            e = float(np.max(np.abs(target[:2] - s[:2])))
+            S["detail"] = f"offset u{s[0]:+.2f} v{s[1]:+.2f}"
+            if e < args.deadband:
+                stable += 1
+                last_end = time.monotonic()
+                if stable >= args.stable_frames:
+                    return True
+                continue
+            stable = 0
+            d = servo_step(J, s, target, (0, 1), args.gain, args.max_step)
+            cur = shared["cur"]
+            new = np.clip(cur + d, np.minimum(lo, cur), np.maximum(hi, cur))
+            safe, hit = obs.constrain(cur, new)
+            if hit:
+                say(f"Centring would enter {hit}; stopping short of it.")
+            steps += 1
+            if not real:
+                say(f"Dry run: I would centre it with a move of {d[0]:+.0f} {d[1]:+.0f} {d[2]:+.0f} mm "
+                    f"(offset u{s[0]:+.2f} v{s[1]:+.2f}). Assuming it is centred and planning from here.")
+                return True
+            last_end = move_blocking(safe)
+
+    def refine_direction():
+        """Once centred, the camera axis keeps the object centred. Test that with a short forward move along the planned
+        direction: any sideways drift of the object in the image means the direction is slightly off, and J turns the
+        drift into the correction. Moves back afterwards."""
+        nonlocal ddir
+        sn0 = wait_fresh(time.monotonic() + 0.1, 2.0)
+        if sn0 is None or not real:
+            return
+        s0, p_c, step = sn0["x"].copy(), shared["cur"].copy(), 15.0
+        tgt = np.clip(p_c + ddir * step, np.minimum(lo, p_c), np.maximum(hi, p_c))
+        safe, hit = obs.constrain(p_c, tgt)
+        if hit or np.linalg.norm(safe - p_c) < step * 0.8:
+            return
+        t_end = move_blocking(safe)
+        sn1 = wait_fresh(t_end + args.settle, 2.0)
+        move_blocking(p_c)
+        time.sleep(args.settle)
+        if sn1 is None:
+            return
+        corr = np.linalg.pinv(J[:2]) @ (sn1["x"][:2] - s0[:2])
+        new = ddir * step - corr
+        new = new / np.linalg.norm(new)
+        ang = float(np.degrees(np.arccos(np.clip(new @ ddir, -1, 1))))
+        ddir = new
+        say(f"Straightened the approach direction by {ang:.1f} deg using a {step:.0f} mm test move.")
+
+    def measure_tip(n=8, timeout=5.0):
+        """Median gripper-to-object distance over several fresh frames while the arm is still."""
+        rng.smooth = None
+        samples, last_t, t0 = [], time.monotonic(), time.monotonic()
+        while len(samples) < n and time.monotonic() - t0 < timeout:
+            check()
+            sn = snapshot()
+            if sn["tip"] is not None and sn["t"] > last_t:
+                samples.append(sn["tip"])
+                last_t = sn["t"]
+            time.sleep(0.02)
+        if len(samples) < max(3, n // 2):
+            return None, 0.0
+        return float(np.median(samples)), float(np.std(samples))
+
+    def get_kin():
+        if "v" not in kin_cache:
+            if args.no_joint_space:
+                kin_cache["v"] = (None, "joint-space planning is off (--no-joint-space)")
+            else:
+                kin_cache["v"] = load_validated(robot) if real else (None, "dry run: no kinematics check")
+            print("kinematics:", kin_cache["v"][1], flush=True)
+        return kin_cache["v"]
+
+    def make_plan(tip):
+        p0 = shared["cur"].copy()
+        plan = build_plan(p0, ddir, tip, cfg["stop_cm"], cfg["open_cm"], cfg["slow_cm"], args.fast_speed, args.slow_speed,
+                          obstacles=obs, bounds=bounds, step_mm=args.plan_step_mm, max_travel_mm=args.max_travel_mm)
+        kin, note = get_kin()
+        if kin is not None:
+            attach_joints(plan, kin, robot.get_joints(), robot.table.apply, args.max_joint_jump)
+        else:
+            plan.notes.append(note + "; using Cartesian moves")
+        return plan
+
+    def speed_at(plan, s):
+        for w in plan.waypoints:
+            if w.s_mm >= s:
+                return max(w.speed, args.slow_speed * 0.5)
+        return args.slow_speed
+
+    def maybe_open(plan, prog):
+        if not S["opened"] and prog >= plan.open_s_mm:
+            S["opened"] = True
+            set_gripper(True)
+            say(f"Opening the gripper now ({prog / 10:.1f} cm travelled, about {cfg['open_cm']:.0f} cm from the object).")
+
+    def run_segment(plan, a, b, v):
+        """Execute waypoints a..b at about v mm/s, watching the arm's real pose."""
+        p0, d, end_s = plan.p0, plan.direction, plan.waypoints[b].s_mm
+        wps = plan.waypoints[a:b + 1]
+        joint_ok = all(w.joints is not None for w in wps) and real
+        fut = None
+        if joint_ok:
+            vmax = segment_joint_speed(plan, a, b, v)
+            fut = robot.move_through_joints([w.joints for w in wps], vmax, vmax * args.joint_accel, wait=False)
+            S["detail"] = f"joint trajectory, up to {vmax:.1f} deg/s"
+        s_cmd = plan.waypoints[a].s_mm
+        futs, t_last = [], time.monotonic()
+        while True:
+            if S["abort"].is_set():
+                if real:
+                    robot.stop()
+                raise Abort()
+            now = time.monotonic()
+            dt, t_last = now - t_last, now
+            if not real:                                               # dry run: walk the path at the planned speed
+                s_cmd = min(end_s, s_cmd + speed_at(plan, s_cmd) * dt)
+                shared["cur"] = p0 + d * s_cmd
+            prog = float(np.dot(shared["cur"] - p0, d))
+            S["progress"] = prog
+            maybe_open(plan, prog)
+            if fut is not None:
+                if fut.done():
+                    err = fut.exception()
+                    if err and "cancel" not in f"{err!r}".lower():
+                        raise RuntimeError(f"the arm refused the trajectory: {err}")
+                    return
+            elif real:                                                  # Cartesian fallback: stream poses along the line
+                if prog >= end_s - 1.0:
+                    return
+                s_cmd = min(end_s, s_cmd + speed_at(plan, s_cmd) * dt, prog + 40.0)
+                pos = p0 + d * s_cmd
+                safe, hit = obs.constrain(shared["cur"], pos)
+                if hit:
+                    raise RuntimeError(f"the line would enter {hit}")
+                futs = [f for f in futs if not f.done()][-1:] + [robot.move_xyz(*safe, wait=False)]
+            elif s_cmd >= end_s - 1e-6:
+                return
+            time.sleep(0.1 if (real and fut is None) else 0.05)
+            S["detail"] = f"{prog / 10:.1f} cm travelled"
+
+    def execute(plan):
+        """-> 'done', or ('replan', measured tip cm) / 'recentre'."""
+        S["phase"] = "executing"
+        if plan.open_s_mm <= 0:
+            maybe_open(plan, 0.0)
+        segs = plan.segments(cfg["slow_cm"])
+        for i, (name, a, b, v) in enumerate(segs):
+            say(f"Leg {i + 1}/{len(segs)} ({name}): {plan.waypoints[a].tip_cm:.1f} -> {plan.waypoints[b].tip_cm:.1f} cm at ~{v:.0f} mm/s")
+            run_segment(plan, a, b, v)
+            if name == "fast" and i + 1 < len(segs) and real:
+                time.sleep(0.4)                                          # let the arm and picture settle, then check
+                sn = wait_fresh(time.monotonic(), 2.0)
+                if sn is None or sn["clipped"]:
+                    say("I can't judge the object here, so I'll continue with the plan.")
+                    continue
+                if float(np.max(np.abs(sn["x"][:2]))) > 2 * args.deadband:
+                    say("The object drifted off-centre; re-centring and re-planning.")
+                    return "recentre"
+                m, _ = measure_tip(n=6)
+                exp = plan.waypoints[b].tip_cm
+                if m is not None and abs(m - exp) > max(1.5, 0.25 * exp):
+                    say(f"The object is {m:.1f} cm away, the plan expected {exp:.1f} cm. Re-planning from the measurement.")
+                    return ("replan", m)
+        return "done"
+
+    def mission():
+        nonlocal J, ddir
+        try:
+            S.update(plan=[], waiting=False, progress=None, opened=False)
+            if J is None:
+                if real:
+                    J = probe()
+                    if J is None:
+                        S.update(phase="idle", detail="")
+                        return
+                else:
+                    J = GUESS_J
+                    print("dry run with a GUESSED camera response (use --sink viam to learn the real one)", flush=True)
+                ddir = depth_direction(J)
+            if ddir is None:
+                say("The learned camera response has no depth direction. Re-learn it with the object in clear view (p).")
+                return
+            tip_override, replans = None, 0
+            while True:
+                if not centre():
+                    S.update(phase="idle")
+                    return
+                if tip_override is None:
+                    S.update(phase="aligning", detail="")
+                    refine_direction()
+                    S.update(phase="measuring", detail="")
+                    tip, spread = measure_tip()
+                    if tip is None:
+                        say(f"I can't get a steady distance to the {det['name']}. Stopping.")
+                        S.update(phase="idle")
+                        return
+                else:
+                    tip, tip_override = tip_override, None
+                S.update(phase="planning", detail="")
+                plan = make_plan(tip)
+                lines = describe(plan, cfg["slow_cm"], args.fast_speed, args.slow_speed, cfg["open_cm"], args.tip_offset_mm)
+                S["plan"] = lines
+                say("\n".join(lines))
+                if not plan.ok or plan.travel_mm < 5:
+                    say("I won't execute this plan (it is blocked or there is nothing to do).")
+                    S.update(phase="idle")
+                    return
+                if args.confirm_plan:
+                    S.update(phase="waiting for yes", waiting=True)
+                    S["confirm"].clear()
+                    say("Say 'yes' to execute the plan, or 'stop'.")
+                    while not S["confirm"].wait(0.1):
+                        check()
+                    S["waiting"] = False
+                else:
+                    for k in range(int(args.countdown * 10), 0, -1):
+                        S.update(phase=f"executing in {k / 10:.1f}s (say stop to cancel)")
+                        check()
+                        time.sleep(0.1)
+                result = execute(plan)
+                if result == "done":
+                    break
+                replans += 1
+                if replans > args.replans:
+                    say("Too many re-plans. Stopping here.")
+                    S.update(phase="idle")
+                    return
+                if isinstance(result, tuple):
+                    tip_override = result[1]
+            m, _ = measure_tip(n=4, timeout=2.0)
+            S.update(phase="arrived", detail="")
+            say(f"Arrived: stopped {cfg['stop_cm']:.1f} cm from the {det['name']}"
+                + (f" (the camera now estimates {m:.1f} cm)." if (m is not None and real) else "."))
+        except Abort:
+            S.update(phase="stopped", detail="")
+        except Exception as e:
+            say(f"Mission failed: {type(e).__name__}: {e}")
+            if real:
+                robot.stop()
+            S.update(phase="idle", detail="")
+
+    def start_mission():
+        stop_mission()
+        S["abort"].clear()
+        th = threading.Thread(target=mission, daemon=True)
+        S["thread"] = th
+        th.start()
+
+    def stop_mission(stop_arm=True):
+        S["abort"].set()
+        S["confirm"].set()
+        if stop_arm and real:
+            try:
+                robot.stop()
+            except Exception:
+                pass
+        th = S["thread"]
+        if th is not None and th.is_alive() and th is not threading.current_thread():
+            th.join(timeout=5)
+
+    # ---- chat UI ---------------------------------------------------------------------------------------------------
+    cmdq, ui, pending, coco = queue.Queue(), None, {"confirm": None}, {}
 
     def coco_names():
         if "n" not in coco:
@@ -244,15 +595,18 @@ def main():
         return coco["n"]
 
     def on_text(text):
-        """Runs on the web server thread: answer what is quick, queue what must run on the control loop."""
+        """Runs on the web server thread: answer what is quick, queue what must run on the main loop."""
         c = parse(text)
         k = c["intent"]
         if k == "help":
             return HELP
         if k in ("empty", "unknown"):
             return "I didn't catch that. Try: go to the cup  (or type help)." if k == "unknown" else None
-        if k == "stop":
-            cmdq.put(c)                       # the loop halts the arm; the reply comes from there
+        if k in ("stop", "yes"):
+            if k == "yes" and S["waiting"]:
+                S["confirm"].set()
+                return "Executing the plan."
+            cmdq.put(c)
             return None
         if k == "look":
             r_ = perc.result
@@ -263,22 +617,21 @@ def main():
                 counts[d[5]] = counts.get(d[5], 0) + 1
             return "I see: " + ", ".join(f"{v} {k_}" if v > 1 else k_ for k_, v in sorted(counts.items()))
         if k == "status":
-            st = info.get("status", "idle")
-            return (f"{st}. Target: {det['name']}." + (f" About {info['dist']:.0f} cm away." if info.get("dist") else "")
-                    + f" Stop distance {info.get('stop', 0):.0f} cm." + (" Engaged." if info.get("engaged") else " Not moving."))
+            sn = snapshot()
+            return (f"{S['phase']}{(' - ' + S['detail']) if S['detail'] else ''}. Target: {det['name']}."
+                    + (f" About {sn['tip']:.1f} cm from the object." if sn["tip"] is not None else "")
+                    + f" Stop distance {cfg['stop_cm']:.1f} cm, gripper opens at {cfg['open_cm']:.0f} cm."
+                    + (" Gripper open." if S["opened"] else ""))
         cmdq.put(c)
         return None
 
     def get_status():
-        return {"mode": "LIVE ARM" if real else "DRY RUN", "state": info.get("status", "idle"), "target": det["name"],
-                "distance": None if not info.get("dist") else f"{info['dist']:.0f} cm" + ("" if rng.calibrated else " (est)"),
-                "stop_at": f"{info.get('stop', stop_cm):.0f} cm", "cam_fps": round(grabber.fps.value, 1),
-                "det_fps": round(perc.fps.value, 1)}
-
-    def say(text):
-        print("robot:", text, flush=True)
-        if ui:
-            ui.say(text)
+        sn = snapshot()
+        return {"mode": "LIVE ARM" if real else "DRY RUN", "state": S["phase"] + (f" ({S['detail']})" if S["detail"] else ""),
+                "target": det["name"],
+                "distance": None if sn["tip"] is None else f"{sn['tip']:.1f} cm" + ("" if rng.calibrated else " (est)"),
+                "stop_at": f"{cfg['stop_cm']:.1f} cm", "cam_fps": round(grabber.fps.value, 1),
+                "det_fps": round(perc.fps.value, 1), "plan": S["plan"]}
 
     def choose_object(name):
         """'white cup' -> the model knows 'cup'; keep unknown names for the open-vocabulary model."""
@@ -291,15 +644,15 @@ def main():
         return name, " (that isn't a standard class, so I'll use the slower open-vocabulary model)"
 
     def handle(c):
-        """Runs on the control loop so it can change the lock, the detector and the arm safely."""
-        nonlocal engaged, stop_cm, last_s, lost_n, prev_move, J, last_used, flt_t, dist_cm, seen
+        """Main-loop side of the chat commands."""
         k = c["intent"]
         if k == "target":
+            stop_mission()
             name, note = choose_object(c["name"])
             say(f"Looking for {name}{note} ...")
             if name != det["name"] or det["model"] is None:
                 model, dargs = load_detector(name, args.model, args.prompts, args.conf, args.imgsz, standard="yolov8s.pt")
-                with perc.mu:                                   # swap between two analysed frames
+                with perc.mu:
                     det.update(model=model, dargs=dargs, name=name)
                     lock.unlock()
                     lock.enabled = True
@@ -309,39 +662,56 @@ def main():
                     lock.unlock()
                     lock.enabled = True
             flt.reset()
-            last_s, lost_n, prev_move, dist_cm, seen = None, 0, np.zeros(3), None, False
-            last_used = flt_t = time.monotonic()          # ignore frames analysed for the previous target
+            with mu:
+                snap.update(x=None, tip=None, dist=None)
             if "stop_cm" in c:
-                stop_cm = max(2.0, c["stop_cm"])
-            engaged = True
-            say(f"Going for the {name}: centring it, then moving forward to {stop_cm:.0f} cm."
-                + ("" if real else " (Dry run: the arm will not move.)")
-                + (" First I'll make three small test moves to learn the camera." if real and J is None else ""))
-        elif k == "stop":
-            engaged = False
-            if real:
-                robot.stop()
-            say("Stopped. The arm is holding where it is.")
-        elif k == "pause":
-            engaged = False
-            say("Paused. Say 'resume' to continue.")
+                cfg["stop_cm"] = max(0.5, c["stop_cm"])
+            say(f"Going for the {name}: centre it, then plan a straight approach (fast, slowing below {cfg['slow_cm']:.0f} cm, "
+                f"gripper opens at {cfg['open_cm']:.0f} cm, stop {cfg['stop_cm']:.1f} cm away)."
+                + ("" if real else " (Dry run: the arm will not move.)"))
+            start_mission()
+        elif k in ("stop", "pause"):
+            stop_mission()
+            S.update(phase="stopped", detail="")
+            say("Stopped. The arm is holding where it is." if k == "stop" else "Paused. Say 'resume' to start again.")
         elif k == "resume":
             if lock.locked:
-                engaged, last_s, lost_n = True, None, 0
-                say("Resuming.")
+                say("Resuming: centre, plan, execute.")
+                start_mission()
             else:
                 say("Nothing is locked yet. Tell me what to go to.")
         elif k == "unlock":
-            engaged = False
+            stop_mission()
             with perc.mu:
                 lock.unlock()
             flt.reset()
+            S.update(phase="idle", detail="", plan=[])
             say("Unlocked. Tell me what to go to next.")
-        elif k in ("stop_distance",):
-            stop_cm = max(2.0, c["cm"])
-            say(f"I'll stop {stop_cm:.0f} cm from the object.")
+        elif k == "stop_distance":
+            cfg["stop_cm"] = max(0.5, c["cm"])
+            say(f"I'll stop {cfg['stop_cm']:.1f} cm from the object.")
+        elif k == "set":
+            if c["key"] == "tip_offset_mm":
+                cfg["tip_off_cm"] = c["value"] / 10.0
+                args.tip_offset_mm = c["value"]
+                say(f"OK: the fingertips are {c['value'] / 10:.1f} cm in front of the camera; distances are now gripper-to-object.")
+            else:
+                rng.real_mm, rng.smooth = c["value"], None
+                args.object_height_mm = c["value"]
+                say(f"OK: the {det['name']} is {c['value'] / 10:.1f} cm tall, which sets the distance estimate.")
+        elif k == "calibrate":
+            sn = snapshot()
+            if sn["x"] is None:
+                say("I can't see the object, so I can't calibrate.")
+            else:
+                rng.calibrate(sn["hpx"], c["cm"])
+                say(f"Calibrated: the {det['name']} is {c['cm']:.0f} cm from the camera at this size.")
+        elif k == "gripper":
+            S["opened"] = c["open"]
+            set_gripper(c["open"])
+            say("Opening the gripper." if c["open"] else "Closing the gripper.")
         elif k == "reset":
-            engaged = False
+            stop_mission()
             pending["confirm"] = "reset"
             say("Reset moves every joint to the saved default pose in one sweep (wrist joint 5 turns a long way). "
                 "Keep the area clear and type 'yes' to go, or 'no' to cancel.")
@@ -358,13 +728,21 @@ def main():
             pending["confirm"] = None
             say("OK." if k == "no" else "Nothing to confirm.")
 
+    show = not args.no_display
+    if show:
+        cv2.namedWindow(WIN)
+        cv2.setMouseCallback(WIN, lambda e, x, y, f, p: click.update(pt=(x, y)) if e == cv2.EVENT_LBUTTONDOWN else None)
     if args.ui:
         ui = UIServer(on_text, get_status, args.port).start()
         print(f"chat UI: {ui.url}", flush=True)
-        say(f"Ready ({'LIVE ARM' if real else 'dry run'}). Tell me what to go to, e.g. \"go to the cup\". Type help for commands.")
+        say(f"Ready ({'LIVE ARM' if real else 'dry run'}). Tell me what to go to, e.g. \"go to the cup\". I'll show the plan "
+            "before moving. Type help for commands.")
         if not args.no_browser:
             webbrowser.open(ui.url)
-    prev_status, seen = "", False
+    if args.auto_engage:
+        cmdq.put({"intent": "target", "name": args.lock})
+
+    flt, flt_t, misses, last_print, seen_t = FeatureFilter(), 0.0, 0, 0.0, 0.0
     try:
         while True:
             while True:
@@ -376,189 +754,96 @@ def main():
             if r is None:
                 cv2.waitKey(10) if show else time.sleep(0.01)
                 continue
-            if args.max_frames and n >= args.max_frames:
-                break
-            if worker.error:
-                print("ARM ERROR:", worker.error)
-                break
             if click.get("pt"):
                 mx, my = click.pop("pt")
-                hit = [d for d in r.dets if d[0] <= mx <= d[2] and d[1] <= my <= d[3]]
-                if hit:
-                    d = min(hit, key=lambda d: (d[2] - d[0]) * (d[3] - d[1]))
+                hit_ = [d for d in r.dets if d[0] <= mx <= d[2] and d[1] <= my <= d[3]]
+                if hit_:
+                    d = min(hit_, key=lambda d: (d[2] - d[0]) * (d[3] - d[1]))
                     with perc.mu:
                         lock.pin(d[:4], d[5])
             now = time.monotonic()
-            if engaged and J is None:
-                if real:
-                    J = probe()
-                    if J is None:
-                        engaged = False
-                    continue
-                J = GUESS_J
-                print("dry run with a GUESSED camera response (use --sink viam to learn the real one)", flush=True)
             if r.t > flt_t:                                   # feed every new detection through the filter
                 flt_t = r.t
                 if r.feats is not None:
                     flt.update(r.feats, r.t)
-                    misses, seen = 0, True
-                    dist_cm = rng.cm(flt.x[2] * r.frame.shape[0], r.frame.shape[1])
+                    misses = 0
+                    hpx = flt.x[2] * r.frame.shape[0]
+                    dist = rng.cm(hpx, r.frame.shape[1])
+                    with perc.mu:
+                        bx = lock.box.copy() if lock.locked else None
+                    clipped = bx is not None and (bx[1] <= 2 or bx[3] >= r.frame.shape[0] - 2)
+                    with mu:
+                        snap.update(x=flt.x.copy(), t=r.t, dist=dist, hpx=hpx, clipped=clipped,
+                                    tip=None if dist is None else dist - cfg["tip_off_cm"])
                 else:
                     misses += 1
                     if misses > 5:
                         flt.reset()
-                        dist_cm = None
-            for f in [f for f in futs if f.done()]:
-                futs.remove(f)
-                if f.exception():
-                    print("ARM ERROR:", f.exception())
-                    engaged = False
-            move = None
-            if engaged and now - last_tick >= 1.0 / args.rate:
-                blocked = len([f for f in futs if not f.done()]) >= 2 if args.preempt else worker.busy
-                if blocked:
-                    status = "moving"
-                elif r.t <= (last_used if args.preempt else max(worker.end_t + args.latency, last_used)):
-                    status = "waiting for a fresh frame"
-                else:
-                    dtick, last_tick, last_used = now - last_tick, now, r.t
-                    if flt.x is not None and r.feats is not None:
-                        s = flt.predict(min(now - flt.t + args.lead, 0.6))      # where the cup is heading, now
-                        if args.preempt:                                         # moves the camera has not shown yet
-                            pend = sum((m for ts, m in hist if ts > r.t - args.lag), np.zeros(3))
-                            s = s + J @ pend
-                        last_s, lost_n = s, 0
-                        tgt, fu = target, feats
-                        status = "tracking"
-                        err = tgt[list(fu)] - s[list(fu)]
-                        err_txt = f"offset u{s[0]:+.2f} v{s[1]:+.2f}" + ("" if dist_cm is None else f"  {dist_cm:.0f} cm")
-                        near = np.max(np.abs(err[:2])) < args.deadband
-                        if args.touch and dist_cm is not None:
-                            if abs(J[2]).max() < 1e-5:
-                                status, err_txt = "no depth response - re-probe (p)", "cannot approach"
-                                near = True
-                            elif dist_cm <= stop_cm + 0.5:
-                                status, touching = "ARRIVED - holding", True
-                            else:
-                                touching = False
-                                closer = 0.0                                  # creep closer only while centred
-                                if np.max(np.abs(err[:2])) < 2 * args.deadband:
-                                    closer = args.approach_speed / 10.0 * min(max(dtick, 0.05), 0.5)
-                                d_goal = max(stop_cm, dist_cm - closer)
-                                tgt = np.array([0.0, 0.0, s[2] * dist_cm / d_goal])   # size grows as the distance shrinks
-                                fu, near = (0, 1, 2), False
-                        if status.startswith("ARRIVED") or status.startswith("no depth"):
-                            cmd_pos = shared["cur"].copy()
-                            if status.startswith("ARRIVED"):
-                                move = servo_step(J, s, target, feats, args.gain, args.max_step) if not near else None
-                        elif near and (not args.hold_size or abs(err[2]) < 0.03) and not args.touch:
-                            status = "centred"
-                            cmd_pos = shared["cur"].copy()
-                        else:
-                            status = "approaching" if fu == (0, 1, 2) and args.touch else "tracking"
-                            move = servo_step(J, s, tgt, fu, args.gain, args.max_step)
-                            if status == "approaching":   # slow, and never faster than the approach speed
-                                move = move * min(1.0, args.approach_speed / args.rate / max(np.linalg.norm(move), 1e-9) * 2)
-                    elif last_s is not None and lost_n < args.search_steps:
-                        lost_n += 1                    # cup is out of the picture: keep going where it left
-                        status, err_txt = f"searching {lost_n}/{args.search_steps}", "object not seen"
-                        move = servo_step(J, last_s * 1.5, target, feats, args.gain, args.max_step)
-                    else:
-                        status, err_txt = "lost - holding", "object not seen"
-            elif not engaged:
-                status, err_txt = "idle", ""
-            if move is not None:
-                move = args.smooth * prev_move + (1 - args.smooth) * move     # blend: no sudden direction changes
-                move = move * min(1.0, args.max_speed * (1.0 / args.rate) / max(np.linalg.norm(move), 1e-9))
-                prev_move = move
-                n += 1
-                cur = shared["cur"]
-                if args.preempt:
-                    cmd_pos = np.clip(cmd_pos + move, lo, hi)
-                    hist = [(ts, m) for ts, m in hist if now - ts < 3.0] + [(now, move)]
-                    if real:
-                        futs.append(robot.move_xyz(*cmd_pos, wait=False))
-                        shared["cur"] = cmd_pos.copy()
-                    sent = True
-                else:
-                    sent = worker.submit(move)
-                    if sent and not real:
-                        worker.end_t = time.monotonic()
-                if sent:
-                    print(f"[{n:3}] {status:16} {err_txt:32} gripper x{cur[0]:.0f} y{cur[1]:.0f} z{cur[2]:.0f}  "
-                          f"move {move[0]:+.0f} {move[1]:+.0f} {move[2]:+.0f} mm" + ("" if real else " (dry run)"), flush=True)
-            elif status != "tracking":
-                prev_move = np.zeros(3)
-            info.update(status=status, dist=dist_cm, stop=stop_cm, engaged=engaged)
-            if status != prev_status:
-                if status.startswith("ARRIVED"):
-                    say(f"Arrived: the {det['name']} is about {dist_cm:.0f} cm away. Holding here.")
-                elif status.startswith("lost"):
-                    say(f"I lost sight of the {det['name']}. Holding position." if seen else
-                        f"I can't see a {det['name']} in the camera. Move it into view or try another name.")
-                prev_status = status
+                        with mu:
+                            snap.update(x=None, tip=None, dist=None)
             if now - last_print > 2.0:
                 last_print = now
-                print(f"   cam {grabber.fps.value:.1f} fps, detector {perc.fps.value:.1f} fps, frame age "
-                      f"{now - r.t:.2f}s, {status}", flush=True)
+                sn = snapshot()
+                print(f"[{S['phase']}] {S['detail']}  " + ("" if sn["tip"] is None else f"{sn['tip']:.1f} cm  ")
+                      + f"cam {grabber.fps.value:.0f} fps det {perc.fps.value:.0f} fps", flush=True)
 
             if show or ui:
                 frame = r.frame.copy()
                 h, w = frame.shape[:2]
+                sn = snapshot()
                 with perc.mu:
-                    draw_lock(frame, lock, r.live, dist_cm if r.live else None, rng.calibrated)
-                cv2.drawMarker(frame, (w // 2, h // 2), (0, 255, 0), cv2.MARKER_CROSS, 40, 2)   # where the cup should be
+                    draw_lock(frame, lock, r.live, sn["tip"] if r.live else None, rng.calibrated)
+                cv2.drawMarker(frame, (w // 2, h // 2), (0, 255, 0), cv2.MARKER_CROSS, 40, 2)
                 if r.feats is not None:
                     cv2.line(frame, (w // 2, h // 2), (int((r.feats[0] + 0.5) * w), int((r.feats[1] + 0.5) * h)), (0, 255, 255), 2)
-                col = (0, 200, 0) if engaged else (0, 0, 220)
-                lines = [("ENGAGED" if engaged else "IDLE - space to engage") + f" | {status} | {args.sink}", err_txt,
-                         ("" if dist_cm is None else f"distance {dist_cm:.1f} cm" + ("" if rng.calibrated else " (est)")
-                          + (f"  stop at {stop_cm:.0f} cm" if args.touch else "")),
-                         f"cam {grabber.fps.value:.1f} fps   detector {perc.fps.value:.1f} fps"]
+                busy = S["thread"] is not None and S["thread"].is_alive()
+                col = (0, 200, 0) if busy else (0, 0, 220)
+                lines = [f"{S['phase'].upper() if busy else 'IDLE - say go to the cup'} | {args.sink}", S["detail"],
+                         ("" if sn["tip"] is None else f"gripper-to-object {sn['tip']:.1f} cm" + ("" if rng.calibrated else " (est)")
+                          + f"   stop {cfg['stop_cm']:.1f}  open {cfg['open_cm']:.0f}" + ("  GRIPPER OPEN" if S["opened"] else ""))]
                 for i, text in enumerate(lines):
                     cv2.putText(frame, text, (14, 34 + 34 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 5)
                     cv2.putText(frame, text, (14, 34 + 34 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.8, col if i == 0 else (255, 255, 255), 2)
+                for i, text in enumerate(S["plan"][:9]):                      # the execution plan, on the picture
+                    y = 160 + 24 * i
+                    cv2.putText(frame, text[:110], (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4)
+                    cv2.putText(frame, text[:110], (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 230, 120), 1)
                 if ui:
                     ok_, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
                     if ok_:
                         ui.set_frame(buf.tobytes())
                 if not show:
-                    time.sleep(0.01)
+                    time.sleep(0.005)
                     continue
                 cv2.imshow(WIN, frame)
                 key = cv2.waitKey(5) & 0xFF
                 if key in (ord("q"), 27):
                     break
                 if key == ord(" "):
-                    engaged = not engaged
-                    last_s, lost_n, prev_move = None, 0, np.zeros(3)
-                    cmd_pos = current() if real else shared["cur"].copy()
+                    cmdq.put({"intent": "target", "name": det["name"]})
                 elif key == ord("p"):
-                    J, args.probe = None, True
-                elif key == ord("c") and dist_cm is not None:
-                    rng.calibrate(flt.x[2] * r.frame.shape[0], args.calib_cm)
-                    print(f"calibrated: the object is {args.calib_cm:.0f} cm away at the current size", flush=True)
-                elif key == ord("t") and dist_cm is not None:
-                    stop_cm = dist_cm
-                    print(f"stop distance taught: {stop_cm:.1f} cm (the camera-to-object distance when touching)", flush=True)
+                    J, ddir, args.probe = None, None, True
+                elif key == ord("c") and sn["tip"] is not None:
+                    rng.calibrate(sn["hpx"], args.calib_cm)
+                    print(f"calibrated: the object is {args.calib_cm:.0f} cm from the camera at the current size", flush=True)
+                elif key == ord("t") and sn["tip"] is not None:
+                    cfg["stop_cm"] = max(0.5, sn["tip"])
+                    print(f"stop distance taught: {cfg['stop_cm']:.1f} cm", flush=True)
                 elif key == ord("x"):
-                    engaged = False
-                    if real:
-                        robot.stop()
+                    cmdq.put({"intent": "stop"})
                 elif key == ord("l"):
-                    with perc.mu:
-                        lock.unlock()
-                        lock.enabled = False
+                    cmdq.put({"intent": "unlock"})
                 elif key == ord("r"):
                     with perc.mu:
                         lock.unlock()
                         lock.enabled = True
             else:
-                time.sleep(0.01)
+                time.sleep(0.005)
     finally:
+        shared["alive"] = False
+        stop_mission()
         grabber.stop()
         perc.stop()
-        worker.stop()
         try:
             if real:
                 robot.stop()

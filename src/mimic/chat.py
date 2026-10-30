@@ -39,7 +39,20 @@ def parse(text):
     rest = re.sub(r"\b(within|under|less than|away|from it|from the object|stay|keep|distance of|distance|stop at|get to|"
                   r"be)\b", " ", rest) if cm is not None else rest
 
-    if t in ("yes", "y", "yep", "yeah", "confirm", "ok", "okay", "do it", "yes please", "go ahead"):
+    m = re.search(r"\b(?:fingertips?|finger tips?|gripper tips?|fingers|gripper)\b.*?(\d+(?:\.\d+)?)\s*(cm|mm)\s*"
+                  r"(?:in front|ahead|beyond|past|out)", t)
+    if m:
+        return {"intent": "set", "key": "tip_offset_mm", "value": float(m.group(1)) * (10.0 if m.group(2) == "cm" else 1.0)}
+    m = re.search(r"\b(?:cup|object|it|bottle|mug)\b.*?\b(?:is|are)\s*(\d+(?:\.\d+)?)\s*(cm|mm)\s*(?:tall|high)", t)
+    if m:
+        return {"intent": "set", "key": "object_height_mm", "value": float(m.group(1)) * (10.0 if m.group(2) == "cm" else 1.0)}
+    m = re.search(r"\bcalibrate\b.*?(\d+(?:\.\d+)?)\s*(cm|mm)|\b(?:is|are)\s*(\d+(?:\.\d+)?)\s*(cm|mm)\s*(?:away|from the camera)", t)
+    if m:
+        v = float(m.group(1) or m.group(3))
+        unit = m.group(2) or m.group(4)
+        return {"intent": "calibrate", "cm": v / (10.0 if unit == "mm" else 1.0)}
+    if t in ("yes", "y", "yep", "yeah", "confirm", "ok", "okay", "do it", "yes please", "go ahead", "go", "execute",
+             "proceed", "run it", "execute the plan", "run the plan"):
         return {"intent": "yes"}
     if t in ("no", "n", "cancel", "never mind", "nevermind", "don't", "dont"):
         return {"intent": "no"}
@@ -47,6 +60,9 @@ def parse(text):
             re.search(r"\b(stop|halt|freeze|abort|emergency|estop|e-stop|enough)\b", t) and cm is None
             and not re.search(r"\b(follow|track|lock|go|approach|find)\b", t)):
         return {"intent": "stop"}
+    g = re.search(r"\b(open|close|shut|release|grab)\b.*\bgripper\b|\bgripper\b.*\b(open|close|shut)\b", t)
+    if g:
+        return {"intent": "gripper", "open": bool(re.search(r"\b(open|release)\b", t))}
     if re.search(r"\b(reset|home position|go home|default position|back to default)\b", t):
         return {"intent": "reset"}
     if re.search(r"\b(unlock|forget|release|drop (it|the target)|clear target)\b", t):
@@ -77,4 +93,5 @@ def parse(text):
 
 HELP = ("Tell me what to go to: \"go to the cup\", \"lock on the bottle\", \"approach the white cup\", "
         "\"get within 5 cm of the cup\". Also: stop, pause, resume, unlock, reset, \"what do you see\", status. "
-        "STOP always works and the arm only moves while I'm engaged.")
+        "\"open the gripper\", \"fingertips are 13 cm in front of the camera\", \"the cup is 9 cm tall\", "
+        "\"calibrate 30 cm\". I show the plan before moving. STOP always works and the arm only moves while I'm engaged.")
