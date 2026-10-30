@@ -63,10 +63,21 @@ class Perceiver:
         self.robot, self.camera_name, self.cam, self.intr = robot, camera_name, cam, intr
         self.model, self.dargs, self.label, self.person_mm = model, dargs, label, person_mm
         self.lock, self.widths, self.heights = Lock(max_jump_frac=0.5, lost_after=10 ** 6), [], []
+        self.expected = None          # world position of the object we are after: re-locking picks the candidate NEAREST TO IT
+        self.gate_mm = 150.0          # ...and ignores anything further than this from it (a different bottle: they are ~30 cm apart)
 
     def reset(self):
         self.lock.unlock()
         self.widths, self.heights = [], []
+
+    async def _world(self, box, z, w, h):
+        """World position of a box's object centre (front surface + half its width), from its box and depth."""
+        sx, sy = w / self.intr["w"], h / self.intr["h"]
+        fx, fy, cx, cy = self.intr["fx"] * sx, self.intr["fy"] * sy, self.intr["cx"] * sx, self.intr["cy"] * sy
+        zc = z + (box[2] - box[0]) * z / fx / 2
+        pose = Pose(x=((box[0] + box[2]) / 2 - cx) * zc / fx, y=((box[1] + box[3]) / 2 - cy) * zc / fy, z=zc)
+        wp = (await self.robot.transform_pose(PoseInFrame(reference_frame=self.camera_name, pose=pose), "world")).pose
+        return np.array([wp.x, wp.y, wp.z])
 
     async def look(self):
         imgs = (await self.cam.get_images())[0]
@@ -87,8 +98,20 @@ class Perceiver:
                 pd = box_depth_mm(dmap, d[:4])
                 person_close = person_close or bool(pd and pd < self.person_mm)
         cands = object_candidates(dets, self.label)
-        if not self.lock.locked:                         # choose the NEAREST one first (by depth), then stay on it
-            cands = sorted(cands, key=lambda c: box_depth_mm(dmap, c[:4]) or 1e9)
+        if not self.lock.locked:                         # (re)lock: the one nearest where it was; the first time, the nearest by depth
+            scored = []
+            for c in cands:
+                zc_ = box_depth_mm(dmap, c[:4])
+                if not zc_:
+                    continue
+                if self.expected is None:
+                    scored.append((zc_, c))
+                else:
+                    wd = await self._world(c[:4], zc_, w, h)
+                    dd = float(np.linalg.norm(wd - self.expected))
+                    if dd <= self.gate_mm:
+                        scored.append((dd, c))
+            cands = [c for _, c in sorted(scored, key=lambda t: t[0])]
         if not self.lock.update(cands, w):
             return {"seen": False, "person_close": person_close}
         box = tuple(float(v) for v in self.lock.box)
@@ -105,8 +128,19 @@ class Perceiver:
             self.heights = (self.heights + [height])[-15:]
         zc = z + (width or 0.0) / 2                       # centre of the object: front surface + half its width
         u, v = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        hpx = float(np.median(self.heights)) * fy / z if len(self.heights) >= 3 else None      # its true size in pixels
+        wpx = float(np.median(self.widths)) * fx / z if len(self.widths) >= 3 else None
+        if hpx and box[3] > h - 3 and box[1] > 3:         # cut off by the bottom of the picture: top edge + half its height
+            v = box[1] + hpx / 2
+        elif hpx and box[1] <= 3 and box[3] < h - 3:      # cut off by the top
+            v = box[3] - hpx / 2
+        if wpx and box[0] < 3 and box[2] < w - 3:         # cut off by the left / right side
+            u = box[2] - wpx / 2
+        elif wpx and box[2] > w - 3 and box[0] > 3:
+            u = box[0] + wpx / 2
         cam_pt = Pose(x=(u - cx) * zc / fx, y=(v - cy) * zc / fy, z=zc)
         wp = (await self.robot.transform_pose(PoseInFrame(reference_frame=self.camera_name, pose=cam_pt), "world")).pose
+        self.expected = np.array([wp.x, wp.y, wp.z])      # follow this object from now on
         return {"seen": True, "world": np.array([wp.x, wp.y, wp.z]), "depth_mm": z, "width_mm": width, "height_mm": height,
                 "person_close": person_close}
 
@@ -125,6 +159,8 @@ async def main_async(args):
         intr = {"fx": ip.focal_x_px, "fy": ip.focal_y_px, "cx": ip.center_x_px, "cy": ip.center_y_px, "w": ip.width_px, "h": ip.height_px}
         model, dargs = load_detector(args.object)
         eye = Perceiver(robot, args.camera, cam, intr, model, dargs, args.object, args.person_mm)
+        if args.near_world:
+            eye.expected = np.array([float(v) for v in args.near_world.split(",")])
 
         def confirm(q):
             return args.yes or input(f"{q} Type 'yes' to continue: ").strip().lower() == "yes"
@@ -154,6 +190,36 @@ async def main_async(args):
                 print(f"  the object moved {np.linalg.norm(t['world'] - prev):.0f} mm: re-targeting", flush=True)
             return t, 0
 
+        async def reacquire(known):
+            """Lost it. It has probably not gone anywhere, it just left the picture: back off along the camera axis, then sweep
+            the base joint a few degrees each way, looking after every move. Returns a fresh target, or None."""
+            print("lost the object: searching nearby ...", flush=True)
+            gp = await gripper_pose()
+            gpos, axis = np.array([gp.x, gp.y, gp.z]), unit([gp.o_x, gp.o_y, gp.o_z])
+            for retreat in (80.0, 160.0):
+                await go(gpos - axis * retreat, gp)
+                eye.lock.unlock()
+                for _ in range(3):
+                    t, _ = await next_target(None, 0)
+                    if t:
+                        print(f"  found it again after backing off {retreat:.0f} mm", flush=True)
+                        return t
+                    await asyncio.sleep(0.2)
+            j_here = list((await arm.get_joint_positions()).values)
+            for d in (6.0, -6.0, 12.0, -12.0):             # base yaw sweep, bounded to +/-12 degrees
+                j = list(j_here)
+                j[0] += d
+                await arm.move_to_joint_positions(JointPositions(values=j))
+                eye.lock.unlock()
+                for _ in range(3):
+                    t, _ = await next_target(None, 0)
+                    if t:
+                        print(f"  found it again after turning the base {d:+.0f} deg", flush=True)
+                        return t
+                    await asyncio.sleep(0.2)
+            await arm.move_to_joint_positions(JointPositions(values=j_here))
+            return None
+
         # ---- look first (dry run: keep looking, so you can move the bottle and watch the target follow) ----
         tgt, misses, prev = None, 0, None
         for i in range(args.looks if not real else 5):
@@ -170,39 +236,52 @@ async def main_async(args):
             else:
                 print(f"[look {i + 1}] no {args.object} seen", flush=True)
             await asyncio.sleep(0.5)
-        if not tgt:
-            raise SystemExit(f"no {args.object} with a depth reading in view")
-        reach = float(np.hypot(*tgt["world"][:2]))
+        not_in_view = tgt is None
+        if not_in_view and (not real or eye.expected is None):
+            raise SystemExit(f"no {args.object} with a depth reading in view" + ("" if eye.expected is None else
+                             " (it is not visible from this pose; a real run will search for it)"))
+        known0 = eye.expected if not_in_view else tgt["world"]
+        reach = float(np.hypot(*known0[:2]))
         print(f"the object is {reach:.0f} mm from the base axis (arm reach ~850 mm); width estimate {eye.width_estimate()} mm", flush=True)
         if reach > args.max_reach_mm:
             raise SystemExit(f"{reach:.0f} mm is beyond --max-reach-mm {args.max_reach_mm:.0f}: not reachable from here")
         if not real:
             print("DRY RUN: nothing moved.")
             return
-        if not confirm("The arm WILL make planned moves toward the nearest object, re-planning every step. E-stop in reach?"):
+        if not confirm("The arm WILL make planned moves toward the nearest object, re-planning every step"
+                       + (" (it cannot see it from here, so it will first search nearby: back off, sweep the base)" if not_in_view else "")
+                       + ". E-stop in reach?"):
             return
+        if not_in_view:
+            tgt = await reacquire(known0)
+            if not tgt:
+                raise SystemExit("could not find the object by searching nearby; stopping")
 
         # ---- stage A: approach the pre-grasp pose in short re-planned steps ----
         await gripper.do_command({"set": 840.0})
         j6_start = (await arm.get_joint_positions()).values[5]
-        prev, misses = None, 0
+        prev, misses, known = None, 0, tgt["world"]
         for cycle in range(1, args.max_cycles + 1):
             tgt, misses = await next_target(prev, misses)
-            if not tgt:
-                if misses > 5:
-                    raise SystemExit("lost the object for too long; stopping")
-                await asyncio.sleep(0.2)
-                continue
-            prev = tgt["world"]
+            if tgt:
+                prev = known = tgt["world"]
+            elif misses > 2:                               # still lost after a few tries: go and look for it
+                tgt = await reacquire(known)
+                if not tgt:
+                    raise SystemExit("could not find the object again after searching nearby; stopping")
+                misses, prev = 0, tgt["world"]
+                known = prev
             gp = await gripper_pose()
             gpos = np.array([gp.x, gp.y, gp.z])
-            pre = tgt["world"] - unit(tgt["world"] - gpos) * args.standoff_mm
+            goal = tgt["world"] if tgt else known           # a stationary object has not gone anywhere: keep the last known spot
+            pre = goal - unit(goal - gpos) * args.standoff_mm
             err = pre - gpos
             if np.linalg.norm(err) < args.tol_mm:
                 print("at the pre-grasp pose", flush=True)
                 break
             await go(gpos + unit(err) * min(np.linalg.norm(err), args.step_mm), gp)
-            print(f"[A {cycle}] {np.linalg.norm(err):.0f} mm to the pre-grasp pose; object at x{tgt['world'][0]:.0f} y{tgt['world'][1]:.0f} z{tgt['world'][2]:.0f}", flush=True)
+            print(f"[A {cycle}] {np.linalg.norm(err):.0f} mm to the pre-grasp pose; object at x{goal[0]:.0f} y{goal[1]:.0f} z{goal[2]:.0f}"
+                  + ("" if tgt else " (last known: out of view)"), flush=True)
         else:
             raise SystemExit("did not reach the pre-grasp pose within the cycle limit")
         d6 = (await arm.get_joint_positions()).values[5] - j6_start
@@ -252,7 +331,12 @@ async def main_async(args):
             if t:
                 last = t["world"]
             elif misses > 3 and np.linalg.norm(last - gpos) > 200:
-                raise SystemExit("lost the object while it was still far away; stopping")
+                t = await reacquire(last)
+                if not t:
+                    raise SystemExit("lost the object while it was still far away and could not find it again; stopping")
+                misses, last = 0, t["world"]
+                gp = await gripper_pose()
+                gpos, axis = np.array([gp.x, gp.y, gp.z]), unit([gp.o_x, gp.o_y, gp.o_z])
             rel = last - gpos                              # dead-reckon on the last known position when it is out of view
             along = float(rel @ axis)
             lateral = rel - along * axis
@@ -302,6 +386,7 @@ def main():
     ap.add_argument("--arm", default="arm")
     ap.add_argument("--gripper", default="gripper")
     ap.add_argument("--sink", choices=["sim", "viam"], default="sim", help="sim = dry run, nothing moves")
+    ap.add_argument("--near-world", help="x,y,z (mm, world): start with the object nearest this point (to pick a particular one)")
     ap.add_argument("--looks", type=int, default=8, help="dry run: how many times to look (move the object to watch it follow)")
     ap.add_argument("--standoff-mm", type=float, default=150.0, help="pre-grasp distance short of the object")
     ap.add_argument("--hold-mm", type=float, default=0.0, help="stop this far short of the object centre along the gripper axis")
