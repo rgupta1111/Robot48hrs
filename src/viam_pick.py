@@ -289,35 +289,37 @@ async def main_async(args):
         if abs(d6) > 90:
             raise SystemExit("joint 6 turned a long way; stopping here")
 
-        # ---- stage B: flatten with one wrist joint ----
-        if not confirm(f"FLATTEN: rotate joint {args.wrist_joint} only, in 10-degree steps (up to {args.wrist_deg:.0f}), until the gripper is level."):
+        # ---- stage B: flatten with ONE wrist joint (4 or 5, whichever flattens it from this pose; never 6) ----
+        candidates = [args.wrist_joint] if args.wrist_joint else [4, 5]
+        if not confirm(f"FLATTEN: rotate joint {' or '.join(str(c) for c in candidates)} only (whichever levels the gripper; never 6), "
+                       f"in 10-degree steps up to {args.wrist_deg:.0f}."):
             return
-        wj = args.wrist_joint - 1
         j0 = list((await arm.get_joint_positions()).values)
-        sign = args.wrist_sign
-        if not sign:                                      # 10-degree test each way: which flattens it and points it forward?
-            p0, options = await gripper_pose(), []
-            for sg in (1, -1):
+        p0, results = await gripper_pose(), []
+        for jn in candidates:
+            for sg in ((args.wrist_sign,) if args.wrist_sign else (1, -1)):
                 t = list(j0)
-                t[wj] += sg * 10.0
+                t[jn - 1] += sg * 10.0                        # 10-degree test move, then straight back
                 await arm.move_to_joint_positions(JointPositions(values=t))
                 p1 = await gripper_pose()
                 await arm.move_to_joint_positions(JointPositions(values=j0))
-                if abs(p1.o_z) < abs(p0.o_z) - 0.02:
-                    options.append((sg, p1.o_x > p0.o_x))
-            if not options:
-                raise SystemExit(f"joint {args.wrist_joint} does not flatten the gripper from here; use --wrist-sign / check the joint")
-            sign = next((sg for sg, fwd in options if fwd), options[0][0])
+                gain = abs(p0.o_z) - abs(p1.o_z)              # how much more level it got
+                results.append((gain, p1.o_x > p0.o_x, jn, sg))
+                print(f"  test: joint {jn} {sg * 10:+.0f} deg -> levels by {gain:+.2f}" + (", pointing more forward" if p1.o_x > p0.o_x else ""), flush=True)
+        good = [r for r in results if r[0] > 0.02]
+        if not good:
+            raise SystemExit(f"neither joint {' nor '.join(str(c) for c in candidates)} levels the gripper from here; not rotating")
+        _, _, jn, sign = max(good, key=lambda r: (r[1], r[0]))   # prefer pointing forward, then the biggest levelling
         total = 0.0
         while total < args.wrist_deg:
             total += min(10.0, args.wrist_deg - total)
             t = list(j0)
-            t[wj] += sign * total
+            t[jn - 1] += sign * total
             await arm.move_to_joint_positions(JointPositions(values=t))
             if abs((await gripper_pose()).o_z) < 0.05:
                 break
         gp = await gripper_pose()
-        print(f"joint {args.wrist_joint} rotated {sign * total:+.0f} deg; gripper axis ({gp.o_x:+.2f}, {gp.o_y:+.2f}, {gp.o_z:+.2f})", flush=True)
+        print(f"joint {jn} rotated {sign * total:+.0f} deg; gripper axis ({gp.o_x:+.2f}, {gp.o_y:+.2f}, {gp.o_z:+.2f})", flush=True)
 
         # ---- stage C: advance along the gripper axis, correcting sideways, still re-planning ----
         if not confirm("ADVANCE along the gripper axis onto the object (re-planned every step), then CLOSE and lift."):
@@ -399,7 +401,8 @@ def main():
     ap.add_argument("--max-reach-mm", type=float, default=800.0, help="refuse objects further than this from the base axis")
     ap.add_argument("--max-cycles", type=int, default=60)
     ap.add_argument("--grip-width-mm", type=float, help="override the measured width (the fingers close to this opening)")
-    ap.add_argument("--wrist-joint", type=int, default=4, help="joint that flattens the gripper (Viam app numbering)")
+    ap.add_argument("--wrist-joint", type=int, default=0, help="joint that flattens the gripper (Viam app numbering); 0 = try 4 and 5 and pick "
+                    "the one that works from the current pose (never 6)")
     ap.add_argument("--wrist-deg", type=float, default=90.0)
     ap.add_argument("--wrist-sign", type=int, choices=[-1, 0, 1], default=0)
     ap.add_argument("--lift-mm", type=float, default=120.0)
