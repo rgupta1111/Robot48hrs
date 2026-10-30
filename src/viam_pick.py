@@ -796,10 +796,15 @@ async def main_async(args):
                                                                                                args.handover_z_mm]), gp)))
                 await check_j6()
                 j0 = list((await arm.get_joint_positions()).values)
-                offsets = [0.0] + [a_ * sg for a_ in np.arange(args.scan_step_deg, args.scan_deg + 1e-6, args.scan_step_deg) for sg in (1.0, -1.0)]
+                near = [0.0] + [a_ * sg for a_ in np.arange(args.scan_step_deg, args.scan_deg + 1e-6, args.scan_step_deg) for sg in (1.0, -1.0)]
+                wide = [args.scan_wide_deg * sg for sg in (1.0, -1.0)] if args.scan_wide_deg > args.scan_deg else []      # only if nobody is in the first sweep
                 seen_people = []                                       # (distance from the base axis, pan offset, world position)
-                for off in offsets:
+                for off in near + wide:
+                    if off in wide and seen_people:
+                        break                                          # found someone within +/-scan-deg: no need to look wider
                     check_stop()
+                    if off in wide and off == wide[0]:
+                        say(f"  nobody within +/-{args.scan_deg:.0f} deg: looking out to +/-{args.scan_wide_deg:.0f} deg", flush=True)
                     j = list(j0)
                     j[0] += off
                     await arm.move_to_joint_positions(JointPositions(values=j))
@@ -1471,8 +1476,9 @@ def main():
     ap.add_argument("--person-conf", type=float, default=0.55, help="a 'person' detection below this confidence does not pause the arm")
     ap.add_argument("--person-min-px", type=float, default=160.0, help="...nor one whose box is shorter than this many pixels")
     ap.add_argument("--scan-person", action="store_true", help="after lifting, pan the base (holding the object) to look for a person before handing over")
-    ap.add_argument("--scan-deg", type=float, default=90.0)
-    ap.add_argument("--scan-step-deg", type=float, default=30.0)
+    ap.add_argument("--scan-deg", type=float, default=45.0, help="first sweep: pan out to +/- this many degrees")
+    ap.add_argument("--scan-wide-deg", type=float, default=60.0, help="only if nobody was seen in the first sweep: also look at +/- this")
+    ap.add_argument("--scan-step-deg", type=float, default=15.0)
     ap.add_argument("--scan-radius-mm", type=float, default=500.0, help="distance from the base axis to bring the object in to before scanning")
     ap.add_argument("--ask-handover", action="store_true", help="with --yes: still ask before holding the object out to the person")
     ap.add_argument("--box-obstacle", action="store_true", help="size the planner's obstacle from the YOLO box (width and height measured with the "
