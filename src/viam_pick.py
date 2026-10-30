@@ -270,7 +270,7 @@ async def main_async(args):
             j6 = (await arm.get_joint_positions()).values[5]
             if j6_ref["v"] is None:
                 j6_ref["v"] = j6
-            elif abs(j6 - j6_ref["v"]) > args.max_j6_deg:
+            elif args.max_j6_deg and abs(j6 - j6_ref["v"]) > args.max_j6_deg:
                 raise SystemExit(f"joint 6 has turned {j6 - j6_ref['v']:+.0f} deg since the start (limit {args.max_j6_deg:.0f}): stopping")
 
         async def go_rel(v, touch_ok=False):
@@ -540,7 +540,7 @@ def main():
     ap.add_argument("--wrist-joint", type=int, default=0, help="joint that flattens the gripper (Viam app numbering); 0 = try 4 and 5 and pick "
                     "the one that works from the current pose (never 6)")
     ap.add_argument("--wrist-deg", type=float, default=90.0)
-    ap.add_argument("--max-j6-deg", type=float, default=45.0, help="stop if joint 6 (final roll) turns more than this from where the run began")
+    ap.add_argument("--max-j6-deg", type=float, default=0.0, help="stop if joint 6 (final roll) turns more than this from where the run began (0 = no limit)")
     ap.add_argument("--wrist-sign", type=int, choices=[-1, 0, 1], default=0)
     ap.add_argument("--lift-mm", type=float, default=120.0)
     ap.add_argument("--yes", action="store_true", help="skip the typed confirmations (not recommended)")
