@@ -137,7 +137,7 @@ async def main_async(args):
                         o_x=gp.o_x, o_y=gp.o_y, o_z=gp.o_z, theta=gp.theta)
 
         async def go(pos, gp):
-            await motion.move(Gripper.get_resource_name(args.gripper), PoseInFrame(reference_frame="world", pose=at(pos, gp)))
+            await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=at(pos, gp)))   # this SDK wants the name as a string
 
         async def next_target(prev, misses):
             """look; wait while a person is close; returns (target, misses)."""
