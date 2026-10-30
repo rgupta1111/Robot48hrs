@@ -24,3 +24,13 @@ config and keep a hand on the e-stop. Full controls and options: `python src/arm
 - `src/mimic/` - `arm_tracker`, `hand_tracker`, `controller`, `sinks`
 - `src/tidy/robot.py` - blocking `ViamRobot` wrapper
 - `tests/` - controller/sink unit tests (`pip install -r requirements-dev.txt && pytest`)
+
+## Viam module (runs on the machine)
+`module/` packages the object follower as a Viam generic service, `REPLACE_NAMESPACE:robot48hrs:object-follower`
+(replace the namespace in `meta.json` and `module/follow_service.py` with your org's public namespace).
+It needs an arm, a camera and a vision service (e.g. a YOLO detector) on the machine. Config attributes:
+`arm`, `camera`, `vision` (required); `lock` (class name, default `cup`), `bounds` (6 numbers), `table_to_world` (4),
+`mm_per_px`, `swap_xy`, `flip_u`, `flip_v`, `deadband_mm`, `gain`, `max_step_mm`, `max_speed_mm_s`, `smoothing`,
+`min_confidence`, `loop_hz`. It starts disengaged. DoCommand: `{"command": "engage" | "disengage" | "stop" | "status" |
+"recenter" | "set_lock", "lock": "<class>"}`. Package with `viam module build local`; follow-logic tests are in
+`tests/test_module_logic.py`.

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "REPLACE_NAMESPACE:robot48hrs",
+  "visibility": "private",
+  "url": "https://github.com/rgupta1111/Robot48hrs",
+  "description": "Makes a Viam arm follow a named object (e.g. a cup) seen by a camera + vision service.",
+  "models": [
+    {
+      "api": "rdk:service:generic",
+      "model": "REPLACE_NAMESPACE:robot48hrs:object-follower",
+      "short_description": "Arm follows a locked object; engage / disengage / stop via DoCommand."
+    }
+  ],
+  "entrypoint": "module/run.sh",
+  "first_run": "",
+  "build": {
+    "build": "sh module/build.sh",
+    "path": "module.tar.gz",
+    "arch": ["linux/amd64", "linux/arm64"]
+  }
+}

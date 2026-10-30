@@ -7,7 +7,6 @@ All robot coordinates are mm in the robot frame (arm base at the origin, x forwa
 import json
 import os
 
-import cv2
 import numpy as np
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
@@ -16,6 +15,7 @@ DEFAULT_CALIBRATION = os.path.abspath(os.path.join(ROOT, "data", "camera_calibra
 
 def fit_homography(pixels, xy):
     """pixels, xy: lists of (u, v) and (x, y), at least 4 non-collinear pairs. -> (3x3 matrix, rms error in mm)."""
+    import cv2
     if len(pixels) < 4:
         raise ValueError("need at least 4 calibration points")
     H, _ = cv2.findHomography(np.float32(pixels), np.float32(xy), 0)
@@ -28,6 +28,7 @@ def fit_homography(pixels, xy):
 
 def pixel_to_xy(H, pixels):
     """(u, v) or an (N, 2) array of pixels -> table (x, y) in mm, same shape."""
+    import cv2
     p = np.float32(pixels).reshape(-1, 1, 2)
     out = cv2.perspectiveTransform(p, np.asarray(H, np.float64)).reshape(-1, 2)
     return out[0] if np.ndim(pixels) == 1 else out
