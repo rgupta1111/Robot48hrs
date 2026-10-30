@@ -503,7 +503,7 @@ async def main_async(args):
                     if memory.width:                                  # a cup is no wider than its measured width: stray voxels must not inflate the box
                         dims = np.array([min(dims[0], memory.width + 25.0), min(dims[1], memory.width + 25.0), dims[2]])
             g = Geometry(center=Pose(x=float(centre[0]), y=float(centre[1]), z=float(centre[2])),
-                         box=RectangularPrism(dims_mm=Vector3(x=float(dims[0]), y=float(dims[1]), z=float(dims[2]))), label=args.object)
+                         box=RectangularPrism(dims_mm=Vector3(x=float(dims[0]), y=float(dims[1]), z=float(dims[2]))), label=eye.label)
             return WorldState(obstacles=[GeometriesInFrame(reference_frame="world", geometries=[g])])
 
         j6_ref = {"v": None}
@@ -536,7 +536,7 @@ async def main_async(args):
             allow = None
             if touch_ok and ws is not None:
                 allow = Constraints(collision_specification=[CollisionSpecification(allows=[
-                    CollisionSpecification.AllowedFrameCollisions(frame1="gripper:claws", frame2=args.object)])])
+                    CollisionSpecification.AllowedFrameCollisions(frame1="gripper:claws", frame2=eye.label)])])
             close_in = obstacle_rel is not None and float(obstacle_rel[2]) < args.free_within_mm
             try:
                 try:
@@ -1239,7 +1239,7 @@ async def main_async(args):
             say(f"final check: {along:.0f} mm along, {lat:.0f} mm to the side", flush=True)
             if lat > args.lat_tol_mm or along > hold + 45:
                 await retry_attempt("the object is no longer lined up with the gripper (moved?): not closing")
-        width = args.grip_width_mm or (None if eye.width_estimate() is None else eye.width_estimate() + args.grip_trim_mm)
+        width = args.grip_width_mm or (args.cup_grip_mm if eye.label == "cup" else None) or (None if eye.width_estimate() is None else eye.width_estimate() + args.grip_trim_mm)
         if width is None or not 25.0 <= width <= 80.0:
             raise SystemExit(f"cannot size the grip (estimated width {width}); pass --grip-width-mm. Not closing.")
         if not flags["grip"] and not await confirm(f"CLOSE the gripper to {width:.0f} mm (position {width * 10:.0f}, no force) and lift {args.lift_mm:.0f} mm."):
@@ -1282,6 +1282,7 @@ async def main_async(args):
         except Exception:
             pass
         try:
+            runlog.doc["object"] = eye.label
             runlog.metric("width_mm", memory.width)
             runlog.metric("object_world_mm", None if memory.world is None else [round(float(v), 1) for v in memory.world])
             runlog.finish(sys.exc_info()[1])
@@ -1403,6 +1404,7 @@ def main():
     ap.add_argument("--ask-handover", action="store_true", help="with --yes: still ask before holding the object out to the person")
     ap.add_argument("--box-obstacle", action="store_true", help="size the planner's obstacle from the YOLO box (width and height measured with the "
                     "depth) instead of the voxel map's cluster")
+    ap.add_argument("--cup-grip-mm", type=float, default=70.0, help="grip opening for a cup (the bottle is sized from the camera); --grip-width-mm overrides both")
     ap.add_argument("--retries", type=int, default=2, help="after a failed grasp, start the whole pick again this many times (each retry is confirmed)")
     ap.add_argument("--no-grasp-check", dest="grasp_check", action="store_false", help="do not verify the grasp (fingers closed, cup left the table)")
     ap.add_argument("--open-pos", type=float, default=840.0, help="gripper position units when fully open (10 per mm)")
