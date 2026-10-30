@@ -454,6 +454,8 @@ async def main_async(args):
                 box = vox.object_box(centre, radius_mm=250.0, min_z_mm=args.table_top_mm + 40.0)
                 if box is not None:
                     centre, dims = box
+                    if memory.width:                                  # a cup is no wider than its measured width: stray voxels must not inflate the box
+                        dims = np.array([min(dims[0], memory.width + 25.0), min(dims[1], memory.width + 25.0), dims[2]])
             g = Geometry(center=Pose(x=float(centre[0]), y=float(centre[1]), z=float(centre[2])),
                          box=RectangularPrism(dims_mm=Vector3(x=float(dims[0]), y=float(dims[1]), z=float(dims[2]))), label=args.object)
             return WorldState(obstacles=[GeometriesInFrame(reference_frame="world", geometries=[g])])
