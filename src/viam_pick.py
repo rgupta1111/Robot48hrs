@@ -392,8 +392,18 @@ async def main_async(args):
             return Pose(x=float(pos[0]), y=float(pos[1]), z=float(max(pos[2], args.min_z_mm)),
                         o_x=gp.o_x, o_y=gp.o_y, o_z=gp.o_z, theta=gp.theta)
 
-        async def go(pos, gp):
-            await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=at(pos, gp)))   # this SDK wants the name as a string
+        async def go(pos, gp, obstacle_rel=None):
+            """Planned move of the gripper to a world position, keeping its orientation (this SDK wants the component name as a string). The
+            object is an obstacle when obstacle_rel (its gripper-frame reading) is given. Returns False when the step is unreachable / blocked."""
+            check_stop()
+            try:
+                await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=at(pos, gp)), world_state=await object_obstacle(obstacle_rel))
+            except Exception as e:
+                if "IK solution" in str(e) or "unreachable" in str(e) or "obstacle constraint" in str(e):
+                    return False
+                raise
+            await check_j6()
+            return True
 
         async def rel_of(t, known_world):
             """The object in the GRIPPER's own frame (z = along the gripper axis): straight from the latest reading, or, when it is
@@ -904,37 +914,7 @@ async def main_async(args):
             if not tgt:
                 raise SystemExit("could not find a " + args.object + " by looking around; stopping")
 
-        # ---- stage A: approach the pre-grasp pose in short re-planned steps ----
-        show("approaching", "approaching the pre-grasp pose")
-        await gripper.do_command({"set": 840.0})
-        j6_start = (await arm.get_joint_positions()).values[5]
-        j6_ref["v"] = j6_start
-        prev, misses, known = None, 0, tgt["world"]
-        for cycle in range(1, args.max_cycles + 1):
-            tgt, misses = await next_target(prev, misses)
-            if tgt:
-                prev, known = tgt["world"], memory.world       # remembered position (weighted by the closest sightings)
-            elif misses > 2:                               # still lost after a few tries: go and look for it
-                tgt = await reacquire(known)
-                if not tgt:
-                    raise SystemExit("could not find the object again after searching nearby; stopping")
-                misses, prev, known = 0, tgt["world"], memory.world
-            rel = await rel_of(tgt, known)                 # object in the gripper frame (a stationary object: last known if out of view)
-            pre_g = rel - unit(rel) * args.standoff_mm       # stop standoff_mm short of it, along the line to it
-            if np.linalg.norm(pre_g) < args.tol_mm:
-                say("at the pre-grasp pose", flush=True)
-                break
-            await go_rel(unit(pre_g) * min(np.linalg.norm(pre_g), args.step_mm), obstacle_rel=rel)
-            say(f"[A {cycle}] {np.linalg.norm(pre_g):.0f} mm to the pre-grasp pose; object {rel[2]:.0f} mm ahead, {np.hypot(rel[0], rel[1]):.0f} mm off-axis"
-                  + ("" if tgt else " (last known: out of view)"), flush=True)
-        else:
-            raise SystemExit("did not reach the pre-grasp pose within the cycle limit")
-        d6 = (await arm.get_joint_positions()).values[5] - j6_start
-        say(f"joint 6 changed {d6:+.1f} deg during the approach", flush=True)
-        if abs(d6) > 90:
-            raise SystemExit("joint 6 turned a long way; stopping here")
-
-        # ---- stage B: flatten with ONE wrist joint (4 or 5, whichever flattens it from this pose; never 6) ----
+        # ---- stage B (now FIRST): flatten with ONE wrist joint (4 or 5, whichever flattens it from this pose; never 6) ----
         if abs((await gripper_pose()).o_z) < 0.08:
             say("the gripper is already level: skipping the flatten stage", flush=True)
         else:
@@ -945,6 +925,78 @@ async def main_async(args):
             await flatten()
 
         await set_roll()                                          # the pick happens at the taught gripper roll (joint 6 near -360)
+
+        # ---- stage A: approach the pre-grasp pose in short re-planned steps ----
+        show("approaching", "approaching the pre-grasp pose")
+        await gripper.do_command({"set": 840.0})
+        j6_start = (await arm.get_joint_positions()).values[5]
+        j6_ref["v"] = j6_start
+        prev, misses, known = None, 0, tgt["world"]
+        if args.approach == "horizontal":
+            # HORIZONTAL approach, like a person reaching for a cup: the gripper is already level (stage B ran first). Get to the object's HEIGHT and
+            # SIDEWAYS line while still far away, then go in straight along the gripper's own level axis. Never a diagonal dive at it.
+            for cycle in range(1, args.max_cycles + 1):
+                tgt, misses = await next_target(prev, misses)
+                if tgt:
+                    prev, known = tgt["world"], memory.world
+                elif misses > 2:
+                    tgt = await reacquire(known)
+                    if not tgt:
+                        raise SystemExit("could not find the object again after searching nearby; stopping")
+                    misses, prev, known = 0, tgt["world"], memory.world
+                rel = await rel_of(tgt, known)
+                gp = await gripper_pose()
+                g = np.array([gp.x, gp.y, gp.z])
+                f = np.array([gp.o_x, gp.o_y, 0.0])
+                f = unit(f) if np.linalg.norm(f) > 1e-3 else np.array([1.0, 0.0, 0.0])           # the gripper's level forward direction
+                p_ = (await robot.transform_pose(PoseInFrame(reference_frame=args.gripper, pose=Pose(x=float(rel[0]), y=float(rel[1]), z=float(rel[2]))),
+                                                 "world")).pose
+                ow = np.array([p_.x, p_.y, p_.z])                                                   # the object, from the SAME reading that drives the move
+                v = ow - g
+                ahead = float(v @ f)
+                side = v - ahead * f
+                side[2] = 0.0                                                                       # sideways error, horizontal
+                vert = float(max(ow[2], args.min_z_mm) - g[2])                                      # height error (never below the table-safe floor)
+                off = np.array([side[0], side[1], vert])
+                if np.linalg.norm(off) < args.line_tol_mm and abs(ahead - args.standoff_mm) < args.tol_mm:
+                    say("level with the object and lined up at the pre-grasp distance", flush=True)
+                    break
+                if ahead < args.standoff_mm * 0.8:                                                  # too close to line up: back off along the axis first
+                    step_vec = -f * min(args.step_mm, args.standoff_mm - ahead)
+                elif np.linalg.norm(off) > args.line_tol_mm:                                        # line up: height and sideways, no forward motion
+                    step_vec = off * min(1.0, args.step_mm / np.linalg.norm(off))
+                else:                                                                               # lined up: go straight in
+                    step_vec = f * float(np.clip(ahead - args.standoff_mm, -args.step_mm, args.step_mm))
+                if not await go(g + step_vec, gp, obstacle_rel=rel):
+                    say("  that step is not reachable / blocked: skipping it", flush=True)
+                say(f"[A {cycle}] {ahead:.0f} mm ahead, {np.hypot(side[0], side[1]):.0f} mm sideways, {vert:+.0f} mm in height"
+                    + ("" if tgt else " (last known: out of view)"), flush=True)
+            else:
+                raise SystemExit("did not reach the pre-grasp pose within the cycle limit")
+        else:
+            for cycle in range(1, args.max_cycles + 1):
+                tgt, misses = await next_target(prev, misses)
+                if tgt:
+                    prev, known = tgt["world"], memory.world       # remembered position (weighted by the closest sightings)
+                elif misses > 2:                               # still lost after a few tries: go and look for it
+                    tgt = await reacquire(known)
+                    if not tgt:
+                        raise SystemExit("could not find the object again after searching nearby; stopping")
+                    misses, prev, known = 0, tgt["world"], memory.world
+                rel = await rel_of(tgt, known)                 # object in the gripper frame (a stationary object: last known if out of view)
+                pre_g = rel - unit(rel) * args.standoff_mm       # stop standoff_mm short of it, along the line to it
+                if np.linalg.norm(pre_g) < args.tol_mm:
+                    say("at the pre-grasp pose", flush=True)
+                    break
+                await go_rel(unit(pre_g) * min(np.linalg.norm(pre_g), args.step_mm), obstacle_rel=rel)
+                say(f"[A {cycle}] {np.linalg.norm(pre_g):.0f} mm to the pre-grasp pose; object {rel[2]:.0f} mm ahead, {np.hypot(rel[0], rel[1]):.0f} mm off-axis"
+                      + ("" if tgt else " (last known: out of view)"), flush=True)
+            else:
+                raise SystemExit("did not reach the pre-grasp pose within the cycle limit")
+        d6 = (await arm.get_joint_positions()).values[5] - j6_start
+        say(f"joint 6 changed {d6:+.1f} deg during the approach", flush=True)
+        if abs(d6) > 90:
+            raise SystemExit("joint 6 turned a long way; stopping here")
 
         # ---- stage C: advance along the gripper axis, correcting sideways, still re-planning ----
         show("advancing", "aligning and advancing onto the object")
@@ -1079,6 +1131,10 @@ def main():
     ap.add_argument("--looks", type=int, default=8, help="dry run: how many times to look (move the object to watch it follow)")
     ap.add_argument("--standoff-mm", type=float, default=250.0, help="pre-grasp distance short of the object (the wrist is flattened here, "
                     "well clear of it: the tip swings by several cm)")
+    ap.add_argument("--approach", choices=["horizontal", "direct"], default="horizontal",
+                    help="horizontal: level the gripper first, line up with the object's height and side from far away, then go straight in "
+                    "(like a person's hand); direct: the old diagonal approach")
+    ap.add_argument("--line-tol-mm", type=float, default=30.0, help="--approach horizontal: lined up when the height and sideways errors are within this")
     ap.add_argument("--align-tol-mm", type=float, default=30.0, help="off-axis error above which it only aligns (no forward motion)")
     ap.add_argument("--clearance-mm", type=float, default=120.0, help="stay at least this far ahead of the object while aligning")
     ap.add_argument("--lat-step-mm", type=float, default=25.0, help="longest sideways correction per step")
