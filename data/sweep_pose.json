@@ -1,0 +1,22 @@
+{
+  "name": "sweep pose: gripper vertical, camera looking straight down at the table",
+  "joints_deg_J1_to_J6": [
+    0.9,
+    0.2,
+    -47.2,
+    -180.1,
+    45.0,
+    -191.8
+  ],
+  "tool_mm_arm_frame": [
+    418,
+    6,
+    486
+  ],
+  "tool_direction": [
+    0.04,
+    0.0,
+    -1.0
+  ],
+  "saved": "2026-10-30 13:35:59"
+}

@@ -557,10 +557,10 @@ async def main_async(args):
             """Nothing in view at the start and no remembered position: look around. Sweep the base in --survey-step-deg steps out to
             +/- --survey-deg, looking after each move; stop at the first object seen (nearest by depth in that view)."""
             say(f"no {eye.label} in view: looking around ...", flush=True)
-            try:                                               # exploring is done with the gripper pointing straight down
-                await orient_down()
+            try:                                               # exploring is done from the saved top-down sweep pose
+                await go_sweep_pose()
             except SystemExit as e:
-                say(f"  (could not point the gripper down for the survey: {e})", flush=True)
+                say(f"  (could not go to the sweep pose for the survey: {e})", flush=True)
             t = await wrist_scan()
             if t:
                 return t
@@ -650,6 +650,21 @@ async def main_async(args):
                 check_stop()
             say(f"joint {args.roll_joint} is now {(await arm.get_joint_positions()).values[idx]:.0f} deg", flush=True)
 
+        async def go_sweep_pose():
+            """FIRST step of the sweep: go to the saved sweep pose (data/sweep_pose.json): gripper vertical, camera looking straight down at
+            the table. Falls back to pointing down with joint 5 if there is no saved pose."""
+            import json
+            try:
+                joints = [float(v) for v in json.load(open(args.sweep_pose))["joints_deg_J1_to_J6"]]
+            except (OSError, ValueError, KeyError):
+                say("  no saved sweep pose: pointing the gripper down with joint 5 instead", flush=True)
+                await orient_down()
+                return
+            say("  moving to the saved sweep pose (gripper vertical, looking down at the table) ...", flush=True)
+            await arm.move_to_joint_positions(JointPositions(values=joints))
+            gp = await gripper_pose()
+            say(f"  sweep pose reached: tool axis ({gp.o_x:+.2f}, {gp.o_y:+.2f}, {gp.o_z:+.2f})", flush=True)
+
         async def orient_down():
             """Point the gripper straight DOWN (tool direction o_z -> -1) with ONE of the wrist joints (4 or 5, whichever points it further
             down; never 6), so the camera looks at the table below during the survey. The later flatten stage levels it for the grasp."""
@@ -715,7 +730,7 @@ async def main_async(args):
             stop where the nearest one was seen and lock on it. The memory is reset to that object."""
             say("initial sweep: looking around from the starting pose (object positions change, so always sweep first) ...", flush=True)
             j_start = list((await arm.get_joint_positions()).values)   # the starting (horizontal / near-reset) rotations
-            await orient_down()                                   # the sweep is done with the gripper pointing straight down
+            await go_sweep_pose()                                 # FIRST: the saved top-down sweep pose, then sweep joint 2 around it
             j_here = list((await arm.get_joint_positions()).values)
             offsets = [0.0] + [a * sg for a in np.arange(args.survey_step_deg, args.survey_deg + 1e-6, args.survey_step_deg) for sg in (1.0, -1.0)]
             seen = []
@@ -973,6 +988,8 @@ def main():
                     "yes/no in the chat answer the confirmations")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-browser", action="store_true", help="with --ui: do not open the page automatically")
+    ap.add_argument("--sweep-pose", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "sweep_pose.json"),
+                    help="joint pose (JSON) the sweep starts from: gripper vertical, camera looking straight down at the table")
     ap.add_argument("--down-joint", type=int, default=5, help="joint that points the gripper down for the sweep (5 = wrist pitch; 4 rolls the "
                     "gripper, so it is left alone)")
     ap.add_argument("--no-sweep", action="store_true", help="skip the initial sweep: start from where the arm is (use with --use-memory when "
