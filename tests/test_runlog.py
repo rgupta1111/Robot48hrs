@@ -23,3 +23,8 @@ def test_failure_is_classified():
     d = r.finish(SystemExit("did not reach the object within the cycle limit"))
     assert not d["success"] and d["failure_class"] == "no_convergence" and d["stage_reached"] == "approaching"
     assert classify("stopped from the page") == "operator_stop"
+
+
+def test_grasp_failure_class():
+    assert classify("grasp failed: the cup is still on the table") == "grasp_failed"
+    assert classify("retry declined") == "operator_stop"

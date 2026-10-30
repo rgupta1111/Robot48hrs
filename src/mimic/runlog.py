@@ -5,7 +5,7 @@ import os
 import time
 import uuid
 
-FAILURES = [("lost", "lost_object"), ("could not find", "not_found"), ("no ", "not_found"), ("not reachable", "unreachable"),
+FAILURES = [("grasp failed", "grasp_failed"), ("retry declined", "operator_stop"), ("lost", "lost_object"), ("could not find", "not_found"), ("no ", "not_found"), ("not reachable", "unreachable"),
             ("unreachable", "unreachable"), ("beyond the arm's reach", "unreachable"), ("joint 6", "wrist_limit"),
             ("cycle limit", "no_convergence"), ("stopped from the page", "operator_stop"), ("moved?", "object_moved"),
             ("cannot size", "no_width"), ("memory looks wrong", "bad_memory"), ("collision", "collision"), ("error", "error")]

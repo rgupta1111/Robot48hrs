@@ -111,6 +111,10 @@ class ObjectMemory:
         return True
 
 
+class GraspFailed(Exception):
+    """The grasp did not work (nothing in the gripper / object moved away): the whole attempt can be retried from the start pose."""
+
+
 class Perceiver:
     """One call -> where the tracked object is right now (world frame), how big it is, and whether a person is close."""
 
@@ -124,6 +128,9 @@ class Perceiver:
         self.expected = None          # world position of the object we are after: re-locking picks the candidate NEAREST TO IT
         self.reject_mm = 300.0        # while tracking: a sudden jump of more than this is a DIFFERENT object (e.g. a can the detector also calls a
                                       # cup), not the one we are after: ignore it and drop the lock
+        self.max_sight_mm = 1000.0    # a sighting farther than this from the base axis (or far below the table / above the arm) is a false detection
+        self.confirm_n = 2            # the FIRST sighting must be seen this many looks in a row, within 150 mm, before it is trusted
+        self.candidate, self.person_hits, self.person_info, self.rejected = None, 0, "", 0
         self.gate_mm = 200.0          # ...and ignores anything further than this from it (a different bottle: ~30 cm apart; the world
                                       # estimate itself shifts ~12 cm with the viewpoint)
 
@@ -153,11 +160,15 @@ class Perceiver:
         dmap = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
         self.last_dmap = dmap                                 # for the voxel map
         dets = await asyncio.to_thread(detect, self.model, color, self.dargs)          # YOLO on the GPU
-        person_close = False
+        near_person, self.person_info = False, ""
         for d in dets:
             if d[5] == "person":
                 pd = box_depth_mm(dmap, d[:4])
-                person_close = person_close or bool(pd and pd < self.person_mm)
+                if pd and pd < self.person_mm:
+                    near_person = True
+                    self.person_info = f"person {pd / 10:.0f} cm away, box {int(d[2] - d[0])}x{int(d[3] - d[1])} px, conf {d[4]:.2f}"
+        self.person_hits = self.person_hits + 1 if near_person else 0
+        person_close = self.person_hits >= 2                 # a one-frame flicker does not pause the arm
         cands = object_candidates(dets, self.label)
         self.color, self.cands = color, list(cands)           # for the web page's live view
         if not self.lock.locked:                         # (re)lock: the one nearest where it was; the first time, the nearest by depth
@@ -202,6 +213,16 @@ class Perceiver:
             u = box[0] + wpx / 2
         cam_pt = Pose(x=(u - cx) * zc / fx, y=(v - cy) * zc / fy, z=zc)
         wp = (await self.robot.transform_pose(PoseInFrame(reference_frame=self.camera_name, pose=cam_pt), "world")).pose
+        if np.hypot(wp.x, wp.y) > self.max_sight_mm or not -200.0 < wp.z < 900.0:
+            self.rejected += 1                                # not a place the arm could ever pick from: a false detection
+            self.lock.unlock()
+            return {"seen": False, "person_close": person_close, "rejected": f"x{wp.x:.0f} y{wp.y:.0f} z{wp.z:.0f}"}
+        if self.confirm_n > 1 and self.expected is None:
+            here = np.array([wp.x, wp.y, wp.z])
+            ok_again = self.candidate is not None and float(np.linalg.norm(here - self.candidate[0])) < 150.0
+            self.candidate = (here, (self.candidate[1] + 1) if ok_again else 1)
+            if self.candidate[1] < self.confirm_n:
+                return {"seen": False, "person_close": person_close}
         if self.expected is not None and float(np.linalg.norm(np.array([wp.x, wp.y, wp.z]) - self.expected)) > self.reject_mm:
             self.lock.unlock()                                # it jumped: that is a DIFFERENT object. Do not follow it, do not remember it
             return {"seen": False, "person_close": person_close}
@@ -212,6 +233,7 @@ class Perceiver:
         else:
             rel = (await self.robot.transform_pose(PoseInFrame(reference_frame=self.camera_name, pose=cam_pt), self.gripper_name)).pose
         self.expected = np.array([wp.x, wp.y, wp.z])      # follow this object from now on
+        self.candidate = None
         result = {"seen": True, "world": np.array([wp.x, wp.y, wp.z]), "rel_mm": np.array([rel.x, rel.y, rel.z]), "depth_mm": z, "width_mm": width, "height_mm": height,
                 "person_close": person_close}
         if self.memory is not None:
@@ -280,6 +302,7 @@ async def main_async(args):
         if args.use_memory and memory.load():
             print(f"loaded the remembered {args.object}: world {np.round(memory.world)}, width {memory.width}", flush=True)
         eye = Perceiver(robot, args.camera, args.gripper, cam, intr, model, dargs, args.object, args.person_mm, args.aim_height_frac, memory)
+        eye.max_sight_mm, eye.confirm_n = args.max_sight_mm, args.confirm_sightings
         if memory.world is not None:
             eye.expected = memory.world
         if args.near_world:
@@ -610,7 +633,7 @@ async def main_async(args):
                 await vox_update()
                 if t and t["person_close"]:
                     show("paused", "a person is close: waiting")
-                    say("a person is close to the camera/gripper: waiting", flush=True)
+                    say(f"a person is close to the camera/gripper: waiting ({eye.person_info})", flush=True)
                     await asyncio.sleep(1.0)
                     continue
                 show("tracking" if t and t["seen"] else "searching",
@@ -763,6 +786,32 @@ async def main_async(args):
             for k in (3, 4, 5):
                 j[k] = j_start[k]
             await arm.move_to_joint_positions(JointPositions(values=j))
+
+        async def gripper_pos():
+            """Gripper opening as the module reports it (position units, 10 per mm), or None if the reply has no number."""
+            try:
+                for v in (await gripper.do_command({"get": True})).values():
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        return float(v)
+            except Exception:
+                pass
+            return None
+
+        async def retry_attempt(why):
+            """The grasp failed: open, back away, go to the start pose, and raise GraspFailed so main() starts the whole attempt again
+            (up to --retries times). The person confirms the move first."""
+            n = args.attempt + 1
+            say(f"GRASP FAILED (attempt {n}/{args.retries + 1}): {why}", flush=True)
+            runlog.metric("grasp_failures", args.attempt + 1)
+            if args.attempt >= args.retries:
+                raise SystemExit(f"grasp failed after {n} attempts: {why}")
+            if not await confirm(f"RETRY {n + 1}/{args.retries + 1}: open the gripper, back off 12 cm, go to the start pose and look again."):
+                raise SystemExit("retry declined")
+            await gripper.do_command({"set": 840.0})
+            await asyncio.sleep(1.5)
+            await go_rel(np.array([0.0, 0.0, -120.0]))
+            await arm.move_to_joint_positions(JointPositions(values=list(RESET_JOINTS)))
+            raise GraspFailed(f"grasp failed: {why}")
 
         async def hand_over():
             """Give the object to a person: hold it out toward the nearest person (or at --handover-xyz), wait until they take it (a pull
@@ -1193,19 +1242,40 @@ async def main_async(args):
             along, lat = float(rel[2]), float(np.hypot(rel[0], rel[1]))
             say(f"final check: {along:.0f} mm along, {lat:.0f} mm to the side", flush=True)
             if lat > args.lat_tol_mm or along > hold + 45:
-                raise SystemExit("the object is no longer lined up with the gripper (moved?): not closing")
+                await retry_attempt("the object is no longer lined up with the gripper (moved?): not closing")
         width = args.grip_width_mm or (None if eye.width_estimate() is None else eye.width_estimate() + args.grip_trim_mm)
         if width is None or not 25.0 <= width <= 80.0:
             raise SystemExit(f"cannot size the grip (estimated width {width}); pass --grip-width-mm. Not closing.")
         if not flags["grip"] and not await confirm(f"CLOSE the gripper to {width:.0f} mm (position {width * 10:.0f}, no force) and lift {args.lift_mm:.0f} mm."):
             return
+        table_spot = memory.world.copy() if memory.world is not None else (t["world"].copy() if t else None)
         await gripper.do_command({"set_gripper_speed": 300})
         await gripper.do_command({"set": float(width * 10)})
         await asyncio.sleep(2.5)
-        say(f"gripper position: {await gripper.do_command({'get': True})}", flush=True)
+        closed = await gripper_pos()
+        say(f"gripper position: {closed} (commanded {width * 10:.0f}; {args.open_pos:.0f} = fully open)", flush=True)
+        runlog.metric("gripper_closed_pos", closed)
+        if args.grasp_check and closed is not None and closed >= args.open_pos - 40:
+            await retry_attempt(f"the fingers did not close (position {closed:.0f}): the gripper is not working or is blocked open")
         gp = await gripper_pose()
         await go(np.array([gp.x, gp.y, gp.z + args.lift_mm]), gp)
         say("lifted.")
+        if args.grasp_check and table_spot is not None:          # the cup must have left the table with the gripper
+            eye.reset()
+            seen_again = None
+            for _ in range(3):
+                seen_again, _m = await next_target(table_spot, 0)
+                if seen_again:
+                    break
+                await asyncio.sleep(0.2)
+            if seen_again is not None:
+                moved = float(np.linalg.norm(seen_again["world"][:2] - table_spot[:2]))
+                dz = float(seen_again["world"][2] - table_spot[2])
+                runlog.metric("after_lift_cup_offset_mm", [round(moved, 1), round(dz, 1)])
+                if moved < 80.0 and dz < 40.0:
+                    await retry_attempt(f"the {eye.label} is still on the table where it was ({moved:.0f} mm away, {dz:+.0f} mm in height): nothing was lifted")
+            else:
+                say("  the cup is not on the table any more: taking it as picked up", flush=True)
         show("lifted", "lifted")
         if not args.no_handover:
             await hand_over()
@@ -1319,9 +1389,21 @@ def main():
     ap.add_argument("--wrist-sign", type=int, choices=[-1, 0, 1], default=0)
     ap.add_argument("--lift-mm", type=float, default=120.0)
     ap.add_argument("--yes", action="store_true", help="skip the typed confirmations (not recommended)")
+    ap.add_argument("--retries", type=int, default=2, help="after a failed grasp, start the whole pick again this many times (each retry is confirmed)")
+    ap.add_argument("--no-grasp-check", dest="grasp_check", action="store_false", help="do not verify the grasp (fingers closed, cup left the table)")
+    ap.add_argument("--open-pos", type=float, default=840.0, help="gripper position units when fully open (10 per mm)")
+    ap.add_argument("--max-sight-mm", type=float, default=1000.0, help="ignore sightings farther than this from the base axis (false detections)")
+    ap.add_argument("--confirm-sightings", type=int, default=2, help="the first sighting must repeat this many looks in a row before it is trusted (1 = off)")
     args = ap.parse_args()
+    args.attempt = 0
     try:
-        asyncio.run(main_async(args))
+        while True:
+            try:
+                asyncio.run(main_async(args))
+                break
+            except GraspFailed as e:
+                args.attempt += 1
+                print(f"retrying ({e}): attempt {args.attempt + 1} of {args.retries + 1}", flush=True)
     except KeyboardInterrupt:
         print("interrupted")
 
