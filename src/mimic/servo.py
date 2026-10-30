@@ -60,3 +60,11 @@ class FeatureFilter:
     def predict(self, ahead_s):
         """Where the features will be ahead_s seconds after the last update."""
         return self.x + self.v * ahead_s
+
+
+def approach_factor(err_uv, deadband):
+    """0..1 share of the full approach speed to use for a given centring error (max |u|, |v|, fractions of the frame).
+    Full speed while the error is under 2 x deadband, none from 4 x deadband up, a straight line in between. Replaces an
+    on/off switch at 2 x deadband that flipped every few steps when the error hovered around it (visible jitter)."""
+    e = float(np.max(np.abs(np.asarray(err_uv, float))))
+    return float(np.clip((4.0 * deadband - e) / (2.0 * deadband), 0.0, 1.0))

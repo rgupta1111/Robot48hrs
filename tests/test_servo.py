@@ -1,6 +1,6 @@
 import numpy as np
 
-from mimic.servo import FeatureFilter, estimate_jacobian, features, servo_step
+from mimic.servo import FeatureFilter, approach_factor, estimate_jacobian, features, servo_step
 
 
 def world(J_true, s0):
@@ -56,3 +56,12 @@ def test_filter_smooths_noise_and_estimates_velocity():
     assert np.mean(errs) < np.mean(raw)                              # less jitter than the raw detections
     assert abs(f.v[0] - 0.05) < 0.04                                 # sees the motion
     assert abs(f.predict(0.5)[0] - (0.05 * 5.9 + 0.025)) < 0.05      # and leads it
+
+
+def test_approach_factor_tapers_smoothly_instead_of_switching():
+    db = 0.03
+    assert approach_factor((0.0, 0.05), db) == 1.0           # centred: full speed
+    assert approach_factor((0.0, 0.2), db) == 0.0            # far off: no approach
+    vals = [approach_factor((0.0, e), db) for e in np.linspace(0.05, 0.13, 20)]
+    assert all(a >= b for a, b in zip(vals, vals[1:]))       # never increases as the error grows
+    assert max(abs(a - b) for a, b in zip(vals, vals[1:])) < 0.2   # no jump between neighbouring errors

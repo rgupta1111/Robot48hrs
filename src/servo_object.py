@@ -46,7 +46,7 @@ from local_detect import (COLORS, Lock, Range, color_candidates, crop_gray, dete
                           load_detector, object_candidates, roi_candidates, template_candidates)
 from mimic.chat import HELP, parse  # noqa: E402
 from mimic.pipeline import FrameGrabber, MoveWorker, Perception  # noqa: E402
-from mimic.servo import FeatureFilter, estimate_jacobian, features, servo_step  # noqa: E402
+from mimic.servo import FeatureFilter, approach_factor, estimate_jacobian, features, servo_step  # noqa: E402
 from mimic.ui import UIServer  # noqa: E402
 from reset_position import RESET_JOINTS  # noqa: E402
 from tidy.robot import TableToWorld, ViamRobot  # noqa: E402
@@ -474,9 +474,10 @@ def main():
                                 status, touching = "ARRIVED - holding", True
                             else:
                                 touching = False
-                                closer = 0.0                                  # creep closer only while centred
-                                if np.max(np.abs(err[:2])) < 2 * args.deadband:
-                                    closer = args.approach_speed / 10.0 * min(max(dtick, 0.05), 0.5)
+                                # creep closer in proportion to how well centred it is (a smooth taper, not an on/off
+                                # switch: the error hovers near any threshold and flipped the motion every few steps)
+                                closer = (args.approach_speed / 10.0 * min(max(dtick, 0.05), 0.5)
+                                          * approach_factor(err[:2], args.deadband))
                                 d_goal = max(stop_cm, dist_cm - closer)
                                 tgt = np.array([0.0, 0.0, s[2] * dist_cm / d_goal])   # size grows as the distance shrinks
                                 fu, near = (0, 1, 2), False
