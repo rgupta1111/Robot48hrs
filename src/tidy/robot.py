@@ -57,6 +57,8 @@ class ViamRobot:
             if not key or not key_id:
                 raise SystemExit("set VIAM_API_KEY and VIAM_API_KEY_ID (or pass --viam-insecure for a local server)")
             dial = DialOptions.with_api_key(key, key_id)
+            if ".local.viam.cloud" in address:       # direct LAN connection: skip the WebRTC relay (3x the frame rate)
+                dial.disable_webrtc = True
         self._robot = self._run(RobotClient.at_address(address, RobotClient.Options(dial_options=dial)))
 
         arms = [r.name for r in self._robot.resource_names if r.subtype == "arm"]

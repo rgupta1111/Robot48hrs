@@ -82,13 +82,13 @@ def main():
     ap.add_argument("--rate", type=float, default=15.0, help="control loop rate limit, Hz")
     ap.add_argument("--hold-size", type=float, metavar="FRAC",
                     help="also keep the cup this fraction of the frame height (e.g. 0.3): moves closer/farther")
-    ap.add_argument("--gain", type=float, default=0.4, help="fraction of the error corrected per move")
+    ap.add_argument("--gain", type=float, default=0.8, help="fraction of the error corrected per move")
     ap.add_argument("--max-step", type=float, default=60.0, help="largest single move, mm")
     ap.add_argument("--max-speed", type=float, default=400.0, help="gripper speed limit, mm/s")
-    ap.add_argument("--deadband", type=float, default=0.05, help="stop moving when centred within this fraction of the frame")
+    ap.add_argument("--deadband", type=float, default=0.03, help="stop moving when centred within this fraction of the frame")
     ap.add_argument("--latency", type=float, default=0.05, help="extra seconds to wait after a move before trusting a frame")
-    ap.add_argument("--smooth", type=float, default=0.6, help="0..1 blend with the previous move (higher = smoother, laggier)")
-    ap.add_argument("--lead", type=float, default=0.0, help="extra seconds to aim ahead of the cup's image motion")
+    ap.add_argument("--smooth", type=float, default=0.2, help="0..1 blend with the previous move (higher = smoother, laggier)")
+    ap.add_argument("--lead", type=float, default=0.15, help="extra seconds to aim ahead of the cup's image motion")
     ap.add_argument("--preempt", action="store_true",
                     help="keep moving: send the next move before the last one ends (try it; turn off if the arm complains)")
     ap.add_argument("--lag", type=float, default=0.4, help="--preempt: seconds before a move shows up in the camera image")
