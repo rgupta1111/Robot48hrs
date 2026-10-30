@@ -261,7 +261,8 @@ async def main_async(args):
         ip = (await cam.get_properties()).intrinsic_parameters
         intr = {"fx": ip.focal_x_px, "fy": ip.focal_y_px, "cx": ip.center_x_px, "cy": ip.center_y_px, "w": ip.width_px, "h": ip.height_px}
         model, dargs = load_detector(args.object)
-        WRIST_HOME = (-86.05, 8.90, -272.49)                   # the reset pose's wrist (joints 4, 5, 6): the horizontal-ish rotations the pick starts from
+        RESET_JOINTS = (-0.95, 33.21, -28.59, -86.05, 8.90, -272.49)   # the reset pose: where the pick starts from (cup visible from here)
+        WRIST_HOME = RESET_JOINTS[3:6]                   # the reset pose's wrist (joints 4, 5, 6): the horizontal-ish rotations the pick starts from
 
         async def start_joints():
             """Current joints, but with the wrist (4, 5, 6) set to the reset pose's rotations: what the wrist returns to after the vertical sweep,
@@ -722,7 +723,7 @@ async def main_async(args):
             t = await _survey_inner()
             if not t:
                 return None
-            await restore_wrist(j_start)
+            await arm.move_to_joint_positions(JointPositions(values=list(RESET_JOINTS)))      # back to the full reset pose
             eye.lock.unlock()
             eye.widths, eye.heights = [], []
             for _ in range(3):
@@ -765,15 +766,12 @@ async def main_async(args):
                     if reach <= 1000:
                         seen.append((best["depth_mm"], d, best))
             if not seen:
-                await restore_wrist(j_start)
-                await arm.move_to_joint_positions(JointPositions(values=j_here[:3] + j_start[3:]))
+                await arm.move_to_joint_positions(JointPositions(values=list(RESET_JOINTS)))
                 say("  the sweep saw nothing within reach", flush=True)
                 return None
             _, d, chosen = min(seen, key=lambda x: x[0])
-            say(f"  nearest: seen at joint {args.survey_joint} {d:+.0f} deg; going back there and returning the wrist to its starting rotations", flush=True)
-            j = list(j_start)                                     # wrist (4, 5, 6) and everything else as at the start ...
-            j[args.survey_joint - 1] = j_here[args.survey_joint - 1] + d     # ... except the sweep joint, at the stop where it was seen
-            await arm.move_to_joint_positions(JointPositions(values=j))
+            say(f"  nearest: seen at joint {args.survey_joint} {d:+.0f} deg; returning to the reset pose to start the pick", flush=True)
+            await arm.move_to_joint_positions(JointPositions(values=list(RESET_JOINTS)))     # the whole reset pose, not a mix of poses
             eye.lock.unlock()
             eye.widths, eye.heights = [], []                      # start fresh on the chosen object (the sweep mixed several)
             memory.world, memory.first_world = chosen["world"].copy(), chosen["world"].copy()   # its position as seen from the vertical view
