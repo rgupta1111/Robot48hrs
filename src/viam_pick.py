@@ -119,6 +119,8 @@ class Perceiver:
         self.model, self.dargs, self.label, self.person_mm = model, dargs, label, person_mm
         self.lock, self.widths, self.heights = Lock(max_jump_frac=0.5, lost_after=10 ** 6), [], []
         self.expected = None          # world position of the object we are after: re-locking picks the candidate NEAREST TO IT
+        self.reject_mm = 300.0        # while tracking: a sudden jump of more than this is a DIFFERENT object (e.g. a can the detector also calls a
+                                      # cup), not the one we are after: ignore it and drop the lock
         self.gate_mm = 200.0          # ...and ignores anything further than this from it (a different bottle: ~30 cm apart; the world
                                       # estimate itself shifts ~12 cm with the viewpoint)
 
@@ -196,6 +198,9 @@ class Perceiver:
             u = box[0] + wpx / 2
         cam_pt = Pose(x=(u - cx) * zc / fx, y=(v - cy) * zc / fy, z=zc)
         wp = (await self.robot.transform_pose(PoseInFrame(reference_frame=self.camera_name, pose=cam_pt), "world")).pose
+        if self.expected is not None and float(np.linalg.norm(np.array([wp.x, wp.y, wp.z]) - self.expected)) > self.reject_mm:
+            self.lock.unlock()                                # it jumped: that is a DIFFERENT object. Do not follow it, do not remember it
+            return {"seen": False, "person_close": person_close}
         aim_up = (self.aim_frac - 0.5) * float(np.median(self.heights)) if (self.aim_frac != 0.5 and len(self.heights) >= 3) else 0.0
         if aim_up:                                        # aim higher/lower on the object (world z is up), then express it in the gripper frame
             wp.z += aim_up
