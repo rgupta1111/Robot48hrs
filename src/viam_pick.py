@@ -215,6 +215,36 @@ class Perceiver:
             self.expected = self.memory.world             # follow the remembered object, not just the last sighting
         return result
 
+    async def person_world(self):
+        """World position (mm) of the nearest person in view (chest-ish: the box centre at its depth), or None."""
+        imgs = (await self.cam.get_images())[0]
+        color = depth = None
+        for im in imgs:
+            if "dep" in str(im.mime_type).lower():
+                depth = parse_viam_depth(im.data)
+            else:
+                color = cv2.imdecode(np.frombuffer(im.data, np.uint8), cv2.IMREAD_COLOR)
+        if color is None or depth is None:
+            return None
+        h, w = color.shape[:2]
+        dmap = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+        dets = await asyncio.to_thread(detect, self.model, color, self.dargs)
+        best = None
+        for d in dets:
+            if d[5] != "person":
+                continue
+            z = box_depth_mm(dmap, d[:4])
+            if z and (best is None or z < best[0]):
+                best = (z, d)
+        if best is None:
+            return None
+        z, d = best
+        sx, sy = w / self.intr["w"], h / self.intr["h"]
+        fx, fy, cx, cy = self.intr["fx"] * sx, self.intr["fy"] * sy, self.intr["cx"] * sx, self.intr["cy"] * sy
+        pose = Pose(x=((d[0] + d[2]) / 2 - cx) * z / fx, y=((d[1] + d[3]) / 2 - cy) * z / fy, z=z)
+        wp = (await self.robot.transform_pose(PoseInFrame(reference_frame=self.camera_name, pose=pose), "world")).pose
+        return np.array([wp.x, wp.y, wp.z])
+
     def width_estimate(self):
         if len(self.widths) >= 3:
             return float(np.median(self.widths))
@@ -542,6 +572,47 @@ async def main_async(args):
                 j[k] = j_start[k]
             await arm.move_to_joint_positions(JointPositions(values=j))
 
+        async def hand_over():
+            """Give the object to a person: hold it out toward the nearest person (or at --handover-xyz), wait until they take it (a pull
+            on the arm, or 'release' / 'yes' in the chat), then open the gripper and back away."""
+            person = await eye.person_world()
+            if person is not None:
+                reach_dir = unit([person[0], person[1], 0.0])
+                radius = float(np.clip(np.hypot(person[0], person[1]) - args.handover_gap_mm, 350.0, args.handover_max_reach_mm))
+                spot = np.array([reach_dir[0] * radius, reach_dir[1] * radius, args.handover_z_mm])
+                say(f"a person is at world x{person[0]:.0f} y{person[1]:.0f}: I will hold it out at x{spot[0]:.0f} y{spot[1]:.0f} z{spot[2]:.0f}")
+            else:
+                spot = np.array([float(v) for v in args.handover_xyz.split(",")])
+                say(f"no person seen: I will hold it out at x{spot[0]:.0f} y{spot[1]:.0f} z{spot[2]:.0f}")
+            if not await confirm(f"HAND OVER: move the {eye.label} to x{spot[0]:.0f} y{spot[1]:.0f} z{spot[2]:.0f} and hold it out for you to take."):
+                return
+            gp = await gripper_pose()
+            await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=at(spot, gp)))
+            await check_j6()
+            show("handover", "holding it out: take it, or say 'release'")
+            say(f"Holding the {eye.label} out. Take it: I let go when I feel a pull, or reply 'release' / 'yes'.")
+            await asyncio.sleep(2.0)                                   # let the arm settle, then read the baseline load
+            base = np.array((await arm.do_command({"load": ""})).get("load", [0.0] * 6), float)
+            flags["yes"] = None
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 90 and not flags["stop"]:
+                if flags["yes"]:
+                    say("released on your command")
+                    break
+                load = np.array((await arm.do_command({"load": ""})).get("load", [0.0] * 6), float)
+                if float(np.max(np.abs(load - base))) > args.pull_load:
+                    say("felt a pull: letting go")
+                    break
+                await asyncio.sleep(0.15)
+            else:
+                say("nobody took it within 90 s: still holding it; reply 'release' to let go")
+                return
+            await gripper.do_command({"set": 840.0})                    # open: it is theirs
+            await asyncio.sleep(1.5)
+            await go_rel(np.array([0.0, 0.0, -100.0]))                  # back away 10 cm along the gripper axis
+            say("handed over.")
+            show("done", "handed over")
+
         async def orient_down():
             """Point the gripper straight DOWN (tool direction o_z -> -1) with ONE of the wrist joints (4 or 5, whichever points it further
             down; never 6), so the camera looks at the table below during the survey. The later flatten stage levels it for the grasp."""
@@ -705,11 +776,17 @@ async def main_async(args):
         if not real:
             say("DRY RUN: nothing moved.")
             return
-        if not args.ui and not await confirm(f"The arm WILL first SWEEP joint {args.survey_joint} (up to {args.survey_deg:.0f} degrees each way) to find the nearest {args.object}, "
-                       "then make planned moves toward it, re-planning every step. E-stop in reach?"):
+        if not args.ui and not await confirm(("The arm WILL start from where it is (no sweep), " if args.no_sweep else
+                       f"The arm WILL first SWEEP joint {args.survey_joint} (up to {args.survey_deg:.0f} degrees each way) to find the nearest {args.object}, ")
+                       + "then make planned moves toward it, re-planning every step. E-stop in reach?"):
             return
-        show("sweeping", f"sweeping joint {args.survey_joint} to find the nearest " + eye.label)
-        tgt = await sweep_survey()                                # ALWAYS: positions change between runs
+        if args.no_sweep:
+            tgt = tgt if not_in_view is False else None
+            if tgt is None and known0 is not None:
+                tgt = await reacquire(known0)                      # not in view from here: search nearby around the remembered spot
+        else:
+            show("sweeping", f"sweeping joint {args.survey_joint} to find the nearest " + eye.label)
+            tgt = await sweep_survey()                            # ALWAYS: positions change between runs
         if not tgt:                                               # nothing within reach from the sweep: level the gripper, wrist scan,
             tgt = await find_again(None)                          # wider base sweep, back to the original pose, once more
             if not tgt:
@@ -821,7 +898,9 @@ async def main_async(args):
         gp = await gripper_pose()
         await go(np.array([gp.x, gp.y, gp.z + args.lift_mm]), gp)
         say("lifted.")
-        show("done", "lifted")
+        show("lifted", "lifted")
+        if not args.no_handover:
+            await hand_over()
         await asyncio.sleep(2.0)
     finally:
         try:
@@ -853,6 +932,14 @@ def main():
     ap.add_argument("--no-browser", action="store_true", help="with --ui: do not open the page automatically")
     ap.add_argument("--down-joint", type=int, default=5, help="joint that points the gripper down for the sweep (5 = wrist pitch; 4 rolls the "
                     "gripper, so it is left alone)")
+    ap.add_argument("--no-sweep", action="store_true", help="skip the initial sweep: start from where the arm is (use with --use-memory when "
+                    "the object is already close)")
+    ap.add_argument("--no-handover", action="store_true", help="do not hand the object to a person after lifting it")
+    ap.add_argument("--handover-xyz", default="500,0,350", help="where to hold it out when no person is seen (world mm)")
+    ap.add_argument("--handover-gap-mm", type=float, default=450.0, help="stay this far short of the person")
+    ap.add_argument("--handover-max-reach-mm", type=float, default=650.0, help="never hold it out further than this from the base axis")
+    ap.add_argument("--handover-z-mm", type=float, default=350.0, help="height to hold it out at")
+    ap.add_argument("--pull-load", type=float, default=1.0, help="joint-load change (arm 'load' units) read as a person pulling the object")
     ap.add_argument("--survey-joint", type=int, default=2, help="joint rotated for the INITIAL sweep, Viam app numbering (2 = shoulder: "
                     "sweeps the camera near/far over the table; 1 = base: left/right)")
     ap.add_argument("--survey-deg", type=float, default=20.0, help="initial look-around: sweep that joint out to +/- this many degrees")
