@@ -644,6 +644,8 @@ async def main_async(args):
             results = []
             for jn in (args.down_joint,):                     # joint 5 by default: the wrist pitch. Joint 4 rolls the gripper: left alone
                 for sg in (1, -1):
+                    if not in_limits(jn, j0[jn - 1] + sg * 10.0):
+                        continue
                     t = list(j0)
                     t[jn - 1] += sg * 10.0                        # 10-degree test move, then straight back
                     await arm.move_to_joint_positions(JointPositions(values=t))
@@ -658,6 +660,8 @@ async def main_async(args):
             _, jn, sg = max(good)
             total, last_oz = 0.0, p0.o_z
             while total < 100.0:
+                if not in_limits(jn, j0[jn - 1] + sg * (total + 10.0)):
+                    break
                 total += 10.0
                 t = list(j0)
                 t[jn - 1] += sg * total
