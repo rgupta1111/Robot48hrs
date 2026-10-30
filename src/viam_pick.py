@@ -1240,6 +1240,22 @@ async def main_async(args):
             say(f"[C {cycle}] {along:.0f} mm along the axis, {lat:.0f} mm off to the side" + ("" if t else " (out of view)"), flush=True)
         else:
             raise SystemExit("did not reach the object within the cycle limit")
+        # ---- recentre: the jaws must straddle the cup's centre, so correct the sideways/vertical error (no forward motion) until it is small ----
+        for k in range(1, args.recentre_tries + 1):
+            if flags["grip"]:
+                break
+            t_c, _ = await next_target(last, 0)
+            if not t_c:
+                say("  recentre: cup not visible from here, closing on the last alignment", flush=True)
+                break
+            r_c = t_c["rel_mm"]
+            off = np.array([float(r_c[0]), float(r_c[1])])
+            if np.linalg.norm(off) <= args.recentre_tol_mm:
+                say(f"  recentred: {np.linalg.norm(off):.0f} mm off the gripper axis", flush=True)
+                break
+            step = off * min(1.0, args.lat_step_mm / np.linalg.norm(off))
+            say(f"  recentring [{k}/{args.recentre_tries}]: {off[0]:+.0f} / {off[1]:+.0f} mm off the gripper axis", flush=True)
+            await go_rel(np.array([step[0], step[1], 0.0]), touch_ok=True, obstacle_rel=r_c)
         # ---- re-check before closing: a person may have moved it ----
         t, _ = (None, 0) if flags["grip"] else await next_target(last, 0)
         gp = await gripper_pose()
@@ -1400,6 +1416,8 @@ def main():
                     "refuses because of the cup's box is retried without the cup as an obstacle")
     ap.add_argument("--aim-trim-mm", default="0,0,0", help="x,y,z (gripper frame, mm) added to where the cup is measured to be: corrects a "
                     "constant aiming error (x = along the jaw opening, y = the other sideways axis, z = along the gripper axis)")
+    ap.add_argument("--recentre-tol-mm", type=float, default=6.0, help="before closing, centre the cup between the jaws to within this")
+    ap.add_argument("--recentre-tries", type=int, default=4)
     ap.add_argument("--retries", type=int, default=2, help="after a failed grasp, start the whole pick again this many times (each retry is confirmed)")
     ap.add_argument("--no-grasp-check", dest="grasp_check", action="store_false", help="do not verify the grasp (fingers closed, cup left the table)")
     ap.add_argument("--open-pos", type=float, default=840.0, help="gripper position units when fully open (10 per mm)")
