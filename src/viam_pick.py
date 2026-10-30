@@ -514,6 +514,9 @@ async def main_async(args):
             p0, results = await gripper_pose(), []
             for jn in candidates:
                 for sg in ((args.wrist_sign,) if args.wrist_sign else (1, -1)):
+                    if not in_limits(jn, j0[jn - 1] + sg * 10.0):
+                        say(f"  test: joint {jn} {sg * 10:+.0f} deg would pass its limit: skipped", flush=True)
+                        continue
                     t = list(j0)
                     t[jn - 1] += sg * 10.0                        # 10-degree test move, then straight back
                     await arm.move_to_joint_positions(JointPositions(values=t))
@@ -526,14 +529,27 @@ async def main_async(args):
             if not good:
                 raise SystemExit(f"neither joint {' nor '.join(str(c) for c in candidates)} levels the gripper from here; not rotating")
             _, _, jn, sign = max(good, key=lambda r: (r[1], r[0]))   # prefer pointing forward, then the biggest levelling
-            total = 0.0
+            total, best_total, best_abs = 0.0, 0.0, abs(p0.o_z)
             while total < args.wrist_deg:
-                total += min(10.0, args.wrist_deg - total)
+                step = min(10.0, args.wrist_deg - total)
+                if not in_limits(jn, j0[jn - 1] + sign * (total + step)):
+                    say(f"  joint {jn} would pass its limit: stopping the flatten here", flush=True)
+                    break
+                total += step
                 t = list(j0)
                 t[jn - 1] += sign * total
                 await arm.move_to_joint_positions(JointPositions(values=t))
-                if abs((await gripper_pose()).o_z) < 0.05:
+                oz = abs((await gripper_pose()).o_z)
+                if oz < best_abs - 1e-3:
+                    best_abs, best_total = oz, total
+                if oz < 0.05:
+                    break                                     # level
+                if oz > best_abs + 0.01:                      # it got LESS level: it overshot past level (it would end up pointing up)
                     break
+            t = list(j0)
+            t[jn - 1] += sign * best_total                    # settle at the most level angle reached (never the overshoot)
+            await arm.move_to_joint_positions(JointPositions(values=t))
+            total = best_total
             gp = await gripper_pose()
             say(f"joint {jn} rotated {sign * total:+.0f} deg; gripper axis ({gp.o_x:+.2f}, {gp.o_y:+.2f}, {gp.o_z:+.2f})", flush=True)
 
@@ -564,6 +580,11 @@ async def main_async(args):
                     await asyncio.sleep(0.2)
             await arm.move_to_joint_positions(JointPositions(values=j_here))
             return None
+
+        LIMIT_DEG = {4: 120.0, 5: 120.0}      # wrist joint limits (joint 4 is +/-124 on this arm); stay a few degrees inside them
+
+        def in_limits(jn, deg):
+            return abs(deg) <= LIMIT_DEG.get(jn, 360.0)
 
         async def restore_wrist(j_start):
             """Put the wrist joints (4, 5, 6) back where the run started (the horizontal / near-reset rotations), keeping the other joints."""
