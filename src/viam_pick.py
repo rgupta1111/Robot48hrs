@@ -479,7 +479,7 @@ async def main_async(args):
                                                                                                  z=float(rel[2]))), "world")).pose
             wd, ht = memory.width or 90.0, memory.height or 220.0      # defaults when its size is not known (its box was clipped)
             centre, dims = np.array([wp.x, wp.y, wp.z]), np.array([wd + 10, wd + 10, ht + 10])
-            if vox is not None:                                       # the map's real extent of whatever stands there now, if it has seen it
+            if vox is not None and not args.box_obstacle:             # the map's real extent of whatever stands there now, if it has seen it
                 box = vox.object_box(centre, radius_mm=250.0, min_z_mm=args.table_top_mm + 40.0)
                 if box is not None:
                     centre, dims = box
@@ -1384,6 +1384,8 @@ def main():
     ap.add_argument("--scan-step-deg", type=float, default=30.0)
     ap.add_argument("--scan-radius-mm", type=float, default=500.0, help="distance from the base axis to bring the object in to before scanning")
     ap.add_argument("--ask-handover", action="store_true", help="with --yes: still ask before holding the object out to the person")
+    ap.add_argument("--box-obstacle", action="store_true", help="size the planner's obstacle from the YOLO box (width and height measured with the "
+                    "depth) instead of the voxel map's cluster")
     ap.add_argument("--retries", type=int, default=2, help="after a failed grasp, start the whole pick again this many times (each retry is confirmed)")
     ap.add_argument("--no-grasp-check", dest="grasp_check", action="store_false", help="do not verify the grasp (fingers closed, cup left the table)")
     ap.add_argument("--open-pos", type=float, default=840.0, help="gripper position units when fully open (10 per mm)")

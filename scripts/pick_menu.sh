@@ -9,4 +9,4 @@ case "${1:-}" in
 esac
 scripts/reset_real.sh || exit 1
 grip=(); [ "$obj" = cup ] && grip=(--grip-width-mm 70)      # the cup's taught width; the bottle is sized from the camera
-exec scripts/viam_pick_real.sh "$obj" --ui --voxel --approach horizontal --no-sweep --aim-trim-mm 0,-50,0 --scan-person --yes --ask-handover --retries 0 "${grip[@]}" "$@"
+exec scripts/viam_pick_real.sh "$obj" --ui --voxel --approach horizontal --no-sweep --aim-trim-mm 0,-50,0 --scan-person --box-obstacle --yes --ask-handover --retries 0 "${grip[@]}" "$@"
