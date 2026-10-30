@@ -556,7 +556,7 @@ async def main_async(args):
             print(f"final check: {along:.0f} mm along, {lat:.0f} mm to the side", flush=True)
             if lat > args.lat_tol_mm or along > hold + 45:
                 raise SystemExit("the object is no longer lined up with the gripper (moved?): not closing")
-        width = args.grip_width_mm or eye.width_estimate()
+        width = args.grip_width_mm or (None if eye.width_estimate() is None else eye.width_estimate() + args.grip_trim_mm)
         if width is None or not 25.0 <= width <= 80.0:
             raise SystemExit(f"cannot size the grip (estimated width {width}); pass --grip-width-mm. Not closing.")
         if not confirm(f"CLOSE the gripper to {width:.0f} mm (position {width * 10:.0f}, no force) and lift {args.lift_mm:.0f} mm."):
@@ -617,6 +617,8 @@ def main():
     ap.add_argument("--aim-height-frac", type=float, default=0.5, help="where on the object's height the gripper aims: 0.5 = middle, "
                     "0.85 = near the top, e.g. the neck of a bottle (use with --grip-width-mm = the neck's width)")
     ap.add_argument("--grip-width-mm", type=float, help="override the measured width (the fingers close to this opening)")
+    ap.add_argument("--grip-trim-mm", type=float, default=-1.5, help="added to the camera's width estimate before closing: the detector's box "
+                    "sits slightly outside the object, so the estimate reads wide (79 mm closed 1-2 mm too loose on the bottle). Negative = tighter")
     ap.add_argument("--wrist-joint", type=int, default=0, help="joint that flattens the gripper (Viam app numbering); 0 = try 4 and 5 and pick "
                     "the one that works from the current pose (never 6)")
     ap.add_argument("--wrist-deg", type=float, default=90.0)
