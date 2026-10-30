@@ -354,8 +354,8 @@ async def main_async(args):
 
         async def confirm(q):
             """Typed in the terminal, or answered 'yes' / 'no' in the page's chat."""
-            if args.yes:
-                return True
+            if args.yes and not (args.ask_handover and q.startswith("HAND OVER")):
+                return True                                       # --yes skips every confirmation, except the hand-out with --ask-handover
             if ui:
                 flags["yes"] = None
                 say(q + " Reply 'yes' to continue or 'no' to cancel.")
@@ -1383,6 +1383,7 @@ def main():
     ap.add_argument("--scan-deg", type=float, default=90.0)
     ap.add_argument("--scan-step-deg", type=float, default=30.0)
     ap.add_argument("--scan-radius-mm", type=float, default=500.0, help="distance from the base axis to bring the object in to before scanning")
+    ap.add_argument("--ask-handover", action="store_true", help="with --yes: still ask before holding the object out to the person")
     ap.add_argument("--retries", type=int, default=2, help="after a failed grasp, start the whole pick again this many times (each retry is confirmed)")
     ap.add_argument("--no-grasp-check", dest="grasp_check", action="store_false", help="do not verify the grasp (fingers closed, cup left the table)")
     ap.add_argument("--open-pos", type=float, default=840.0, help="gripper position units when fully open (10 per mm)")
