@@ -337,10 +337,46 @@ async def main_async(args):
             await arm.move_to_joint_positions(JointPositions(values=j_here))
             return None
 
+        async def flatten():
+            """Level the gripper with ONE of the wrist joints (4 or 5; never 6): test +/-10 degrees on each, pick the one that levels it
+            most (preferring the gripper pointing forward), then step it in 10-degree increments until level."""
+            candidates = [args.wrist_joint] if args.wrist_joint else [4, 5]
+            j0 = list((await arm.get_joint_positions()).values)
+            p0, results = await gripper_pose(), []
+            for jn in candidates:
+                for sg in ((args.wrist_sign,) if args.wrist_sign else (1, -1)):
+                    t = list(j0)
+                    t[jn - 1] += sg * 10.0                        # 10-degree test move, then straight back
+                    await arm.move_to_joint_positions(JointPositions(values=t))
+                    p1 = await gripper_pose()
+                    await arm.move_to_joint_positions(JointPositions(values=j0))
+                    gain = abs(p0.o_z) - abs(p1.o_z)              # how much more level it got
+                    results.append((gain, p1.o_x > p0.o_x, jn, sg))
+                    print(f"  test: joint {jn} {sg * 10:+.0f} deg -> levels by {gain:+.2f}" + (", pointing more forward" if p1.o_x > p0.o_x else ""), flush=True)
+            good = [r for r in results if r[0] > 0.02]
+            if not good:
+                raise SystemExit(f"neither joint {' nor '.join(str(c) for c in candidates)} levels the gripper from here; not rotating")
+            _, _, jn, sign = max(good, key=lambda r: (r[1], r[0]))   # prefer pointing forward, then the biggest levelling
+            total = 0.0
+            while total < args.wrist_deg:
+                total += min(10.0, args.wrist_deg - total)
+                t = list(j0)
+                t[jn - 1] += sign * total
+                await arm.move_to_joint_positions(JointPositions(values=t))
+                if abs((await gripper_pose()).o_z) < 0.05:
+                    break
+            gp = await gripper_pose()
+            print(f"joint {jn} rotated {sign * total:+.0f} deg; gripper axis ({gp.o_x:+.2f}, {gp.o_y:+.2f}, {gp.o_z:+.2f})", flush=True)
+
         async def survey():
             """No bottle in view at the start and no remembered position: look around. Sweep the base in 15-degree steps out to
             +/-45 degrees, looking after each move; stop at the first bottle seen (nearest by depth in that view)."""
             print("no bottle in view: looking around ...", flush=True)
+            if abs((await gripper_pose()).o_z) >= 0.08:        # exploring is easier with the gripper level: use the two flattening joints
+                try:
+                    await flatten()
+                except SystemExit as e:
+                    print(f"  (could not level the gripper for the survey: {e})", flush=True)
             j_here = list((await arm.get_joint_positions()).values)
             for d in (15.0, -15.0, 30.0, -30.0, 45.0, -45.0):
                 j = list(j_here)
@@ -390,7 +426,7 @@ async def main_async(args):
             return
         if not confirm("The arm WILL make planned moves toward the nearest object, re-planning every step"
                        + ((" (it cannot see it from here, so it will first search nearby: back off, sweep the base)" if known0 is not None else
-                           " (no bottle in view, so it will first LOOK AROUND: sweep the base left and right, up to 45 degrees)")
+                           " (no bottle in view, so it will first LOOK AROUND: level the gripper with joints 4/5 if it is not level, then sweep the base left and right, up to 45 degrees)")
                           if not_in_view else "")
                        + ". E-stop in reach?"):
             return
@@ -436,32 +472,7 @@ async def main_async(args):
             if not confirm(f"FLATTEN: rotate joint {' or '.join(str(c) for c in candidates)} only (whichever levels the gripper; never 6), "
                            f"in 10-degree steps up to {args.wrist_deg:.0f}."):
                 return
-            j0 = list((await arm.get_joint_positions()).values)
-            p0, results = await gripper_pose(), []
-            for jn in candidates:
-                for sg in ((args.wrist_sign,) if args.wrist_sign else (1, -1)):
-                    t = list(j0)
-                    t[jn - 1] += sg * 10.0                        # 10-degree test move, then straight back
-                    await arm.move_to_joint_positions(JointPositions(values=t))
-                    p1 = await gripper_pose()
-                    await arm.move_to_joint_positions(JointPositions(values=j0))
-                    gain = abs(p0.o_z) - abs(p1.o_z)              # how much more level it got
-                    results.append((gain, p1.o_x > p0.o_x, jn, sg))
-                    print(f"  test: joint {jn} {sg * 10:+.0f} deg -> levels by {gain:+.2f}" + (", pointing more forward" if p1.o_x > p0.o_x else ""), flush=True)
-            good = [r for r in results if r[0] > 0.02]
-            if not good:
-                raise SystemExit(f"neither joint {' nor '.join(str(c) for c in candidates)} levels the gripper from here; not rotating")
-            _, _, jn, sign = max(good, key=lambda r: (r[1], r[0]))   # prefer pointing forward, then the biggest levelling
-            total = 0.0
-            while total < args.wrist_deg:
-                total += min(10.0, args.wrist_deg - total)
-                t = list(j0)
-                t[jn - 1] += sign * total
-                await arm.move_to_joint_positions(JointPositions(values=t))
-                if abs((await gripper_pose()).o_z) < 0.05:
-                    break
-            gp = await gripper_pose()
-            print(f"joint {jn} rotated {sign * total:+.0f} deg; gripper axis ({gp.o_x:+.2f}, {gp.o_y:+.2f}, {gp.o_z:+.2f})", flush=True)
+            await flatten()
 
         # ---- stage C: advance along the gripper axis, correcting sideways, still re-planning ----
         if not confirm("ADVANCE along the gripper axis onto the object (re-planned every step), then CLOSE and lift."):
