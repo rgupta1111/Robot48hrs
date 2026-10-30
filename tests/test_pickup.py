@@ -1,6 +1,6 @@
 import numpy as np
 
-from mimic.pickup import PickupConfig, PickupPlanner, check_jacobian, smooth_move, table_floor_z
+from mimic.pickup import PickupConfig, PickupPlanner, advance_along, check_jacobian, smooth_move, table_floor_z
 
 J = np.array([[0.0, -0.004, 0.0], [-0.003, 0.0, 0.0], [0.0, 0.0, 0.001]])
 
@@ -105,3 +105,9 @@ def test_alternating_noise_gives_smaller_steps_than_raw():
 def test_table_floor_keeps_the_fingertips_above_the_table():
     assert table_floor_z(-123, 105, 30) == 12
     assert table_floor_z(-123, 105, 30) - 105 > -123 + 29          # fingertips end up >= 30 mm above the table top
+
+
+def test_advance_along_moves_along_the_tool_axis():
+    assert np.allclose(advance_along((300, 0, 100), (1, 0, 0), 70), (370, 0, 100))                 # flat, pointing forward
+    assert np.allclose(advance_along((300, 0, 100), (0.6, 0, -0.8), 100), (360, 0, 20))            # tilted down: normalised
+    assert np.allclose(advance_along((1, 2, 3), (0, 0, 0), 50), (1, 2, 3))                          # no direction: stays

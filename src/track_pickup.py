@@ -23,7 +23,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from arm_mimic import PRESETS, floats  # noqa: E402
 from local_detect import Lock, Range, detect, load_detector, object_candidates  # noqa: E402
-from mimic.pickup import check_jacobian, smooth_move, table_floor_z  # noqa: E402
+from mimic.pickup import advance_along, check_jacobian, smooth_move, table_floor_z  # noqa: E402
 from mimic.servo import (FeatureFilter, approach_factor, estimate_jacobian, features, servo_step,  # noqa: E402
                          tip_target_v)
 from mimic.ui import UIServer  # noqa: E402
@@ -55,6 +55,10 @@ def main():
                     "with a 10-degree test and pick the one that flattens the gripper and points it forward")
     ap.add_argument("--flat-floor-mm", type=float, default=80.0, help="--wrist-flat: lowest extent of the gripper below its axis once flat")
     ap.add_argument("--stop-cm", type=float, default=10.0, help="close the gripper at this camera-to-object distance")
+    ap.add_argument("--rotate-cm", type=float, default=15.0, help="--wrist-flat: stop and rotate the wrist at this camera-to-object "
+                    "distance (the fingertips are ~10 cm ahead of the camera, so this is ~5 cm short of the object)")
+    ap.add_argument("--close-cm", type=float, default=8.0, help="--wrist-flat: after flattening, advance along the gripper axis "
+                    "until the camera-to-object distance is this, then close")
     ap.add_argument("--tip-offset-mm", type=float, default=0.0, help="the gripper sits this far below the camera")
     ap.add_argument("--tip-flip", action="store_true", help="the gripper is above the camera instead")
     ap.add_argument("--object-height-mm", type=float, default=100.0, help="true height of the object (for distance)")
@@ -80,6 +84,7 @@ def main():
     args = ap.parse_args()
 
     real, bounds = args.sink == "viam", floats(args.bounds)
+    stop_cm = args.rotate_cm if args.wrist_flat else args.stop_cm       # where the tracking stops
     lo, hi = np.array(bounds[0::2], float), np.array(bounds[1::2], float)
     floor = table_floor_z(args.table_z_mm, args.tool_length_mm, args.table_margin_mm)
     lo[2] = max(lo[2], floor)                          # never command a pose that puts the fingers into the table
@@ -242,13 +247,21 @@ def main():
 
     def grasp():
         if args.wrist_flat:
-            if not confirm(f"Arrived at {args.stop_cm:.0f} cm. ROTATE joint {args.wrist_joint} ONLY (up to {args.wrist_deg:.0f} "
+            if not confirm(f"Arrived at {stop_cm:.0f} cm. ROTATE joint {args.wrist_joint} ONLY (up to {args.wrist_deg:.0f} "
                            "degrees, in 10-degree steps) to make the gripper flat. Keep the area around the arm clear."):
                 return
             if not wrist_flat():
                 return
-        if not confirm(f"{'' if args.wrist_flat else 'Arrived at ' + format(args.stop_cm, '.0f') + ' cm. '}"
-                       f"About to CLOSE the gripper (force cap {args.max_torque}%) and lift."):
+            advance_mm = max(args.rotate_cm - args.close_cm, 0.0) * 10.0
+            if not confirm(f"ADVANCE {advance_mm:.0f} mm along the gripper axis (camera {args.rotate_cm:.0f} -> {args.close_cm:.0f} cm "
+                           f"from the cup), then CLOSE the gripper (force cap {args.max_torque}%) and lift."):
+                return
+            pn = robot.get_pose()
+            robot._orient = None                         # hold the NEW (flat) orientation for the moves that follow
+            goal = np.clip(advance_along(position(), (pn.o_x, pn.o_y, pn.o_z), advance_mm), lo, hi)
+            robot.move_xyz(*goal, wait=True)
+            time.sleep(0.5)
+        elif not confirm(f"Arrived at {stop_cm:.0f} cm. About to CLOSE the gripper (force cap {args.max_torque}%) and lift."):
             return
         try:   # UFactory G2 only; a G1 has no force setting, so the close is then unlimited
             robot.gripper_command({"set_gripper_torque": args.max_torque})
@@ -348,7 +361,7 @@ def main():
             err = target[:2] - s[:2]
             e = float(np.max(np.abs(err)))
             errs = (errs + [e])[-8:]
-            arrived = dist is not None and dist <= args.stop_cm and e < 2 * args.deadband
+            arrived = dist is not None and dist <= stop_cm and e < 2 * args.deadband
             show("arrived" if arrived else "tracking", f"offset u{s[0]:+.2f} v{s[1]:+.2f} aim v{target[1]:+.2f}"
                  + ("" if dist is None else f" {dist:.0f} cm"))
             print(f"[{cycle:3}] offset u{s[0]:+.2f} v{s[1]:+.2f} aim v{target[1]:+.2f}  "
@@ -367,7 +380,7 @@ def main():
                 continue
             # centre on the aim point and, in proportion to how well it is lined up, close the distance
             closer = (args.approach_speed / 10.0 * dt) * approach_factor(err, args.deadband) if dist else 0.0
-            d_goal = max(args.stop_cm, dist - closer) if dist else None
+            d_goal = max(stop_cm, dist - closer) if dist else None
             tgt = np.array([target[0], target[1], s[2] * dist / d_goal if d_goal else s[2]])
             move = servo_step(J, s, tgt, (0, 1, 2) if d_goal else (0, 1), args.gain, args.max_step)
             move = smooth_move(prev, move, args.smooth, args.max_speed * dt)

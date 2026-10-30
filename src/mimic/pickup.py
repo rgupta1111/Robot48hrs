@@ -39,6 +39,13 @@ def table_floor_z(table_z_mm, tool_length_mm, margin_mm):
     return float(table_z_mm + tool_length_mm + margin_mm)
 
 
+def advance_along(pos, direction, mm):
+    """Point mm millimetres further along a direction vector (e.g. the tool axis), from pos. Zero vector: stays put."""
+    d = np.asarray(direction, float)
+    n = float(np.linalg.norm(d))
+    return np.asarray(pos, float) + (d / n * mm if n > 1e-9 else 0.0)
+
+
 def smooth_move(prev, move, blend=0.5, max_mm=None):
     """Blend a new move with the previous one (so the direction cannot flip between cycles) and cap its length.
     blend 0 = no smoothing, 0.9 = very smooth but sluggish. max_mm is the longest allowed step (speed limit * dt)."""
