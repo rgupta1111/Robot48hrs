@@ -59,12 +59,13 @@ async def connect(address):
 class Perceiver:
     """One call -> where the tracked object is right now (world frame), how big it is, and whether a person is close."""
 
-    def __init__(self, robot, camera_name, cam, intr, model, dargs, label, person_mm):
-        self.robot, self.camera_name, self.cam, self.intr = robot, camera_name, cam, intr
+    def __init__(self, robot, camera_name, gripper_name, cam, intr, model, dargs, label, person_mm):
+        self.robot, self.camera_name, self.gripper_name, self.cam, self.intr = robot, camera_name, gripper_name, cam, intr
         self.model, self.dargs, self.label, self.person_mm = model, dargs, label, person_mm
         self.lock, self.widths, self.heights = Lock(max_jump_frac=0.5, lost_after=10 ** 6), [], []
         self.expected = None          # world position of the object we are after: re-locking picks the candidate NEAREST TO IT
-        self.gate_mm = 150.0          # ...and ignores anything further than this from it (a different bottle: they are ~30 cm apart)
+        self.gate_mm = 200.0          # ...and ignores anything further than this from it (a different bottle: ~30 cm apart; the world
+                                      # estimate itself shifts ~12 cm with the viewpoint)
 
     def reset(self):
         self.lock.unlock()
@@ -140,8 +141,9 @@ class Perceiver:
             u = box[0] + wpx / 2
         cam_pt = Pose(x=(u - cx) * zc / fx, y=(v - cy) * zc / fy, z=zc)
         wp = (await self.robot.transform_pose(PoseInFrame(reference_frame=self.camera_name, pose=cam_pt), "world")).pose
+        rel = (await self.robot.transform_pose(PoseInFrame(reference_frame=self.camera_name, pose=cam_pt), self.gripper_name)).pose
         self.expected = np.array([wp.x, wp.y, wp.z])      # follow this object from now on
-        return {"seen": True, "world": np.array([wp.x, wp.y, wp.z]), "depth_mm": z, "width_mm": width, "height_mm": height,
+        return {"seen": True, "world": np.array([wp.x, wp.y, wp.z]), "rel_mm": np.array([rel.x, rel.y, rel.z]), "depth_mm": z, "width_mm": width, "height_mm": height,
                 "person_close": person_close}
 
     def width_estimate(self):
@@ -158,7 +160,7 @@ async def main_async(args):
         ip = (await cam.get_properties()).intrinsic_parameters
         intr = {"fx": ip.focal_x_px, "fy": ip.focal_y_px, "cx": ip.center_x_px, "cy": ip.center_y_px, "w": ip.width_px, "h": ip.height_px}
         model, dargs = load_detector(args.object)
-        eye = Perceiver(robot, args.camera, cam, intr, model, dargs, args.object, args.person_mm)
+        eye = Perceiver(robot, args.camera, args.gripper, cam, intr, model, dargs, args.object, args.person_mm)
         if args.near_world:
             eye.expected = np.array([float(v) for v in args.near_world.split(",")])
 
@@ -174,6 +176,22 @@ async def main_async(args):
 
         async def go(pos, gp):
             await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=at(pos, gp)))   # this SDK wants the name as a string
+
+        async def rel_of(t, known_world):
+            """The object in the GRIPPER's own frame (z = along the gripper axis): straight from the latest reading, or, when it is
+            out of view, the last known world position converted by the frame system. Independent of world-frame drift."""
+            if t:
+                return t["rel_mm"]
+            p = (await robot.transform_pose(PoseInFrame(reference_frame="world", pose=Pose(x=float(known_world[0]), y=float(known_world[1]),
+                                                                                           z=float(known_world[2]))), args.gripper)).pose
+            return np.array([p.x, p.y, p.z])
+
+        async def go_rel(v):
+            """Plan a move of v (mm, gripper frame) from where the gripper is now, keeping its orientation."""
+            p = (await robot.transform_pose(PoseInFrame(reference_frame=args.gripper, pose=Pose(x=float(v[0]), y=float(v[1]), z=float(v[2]))),
+                                            "world")).pose
+            await motion.move(args.gripper, PoseInFrame(reference_frame="world", pose=Pose(
+                x=p.x, y=p.y, z=max(p.z, args.min_z_mm), o_x=p.o_x, o_y=p.o_y, o_z=p.o_z, theta=p.theta)))
 
         async def next_target(prev, misses):
             """look; wait while a person is close; returns (target, misses)."""
@@ -243,8 +261,11 @@ async def main_async(args):
         known0 = eye.expected if not_in_view else tgt["world"]
         reach = float(np.hypot(*known0[:2]))
         print(f"the object is {reach:.0f} mm from the base axis (arm reach ~850 mm); width estimate {eye.width_estimate()} mm", flush=True)
+        if reach > 1000:
+            raise SystemExit(f"{reach:.0f} mm from the base axis: far beyond the arm's reach")
         if reach > args.max_reach_mm:
-            raise SystemExit(f"{reach:.0f} mm is beyond --max-reach-mm {args.max_reach_mm:.0f}: not reachable from here")
+            print(f"warning: the world estimate ({reach:.0f} mm) is past {args.max_reach_mm:.0f} mm, but it shifts ~10 cm with the viewpoint; "
+                  "the approach is measured in the gripper frame and the motion planner refuses anything truly unreachable", flush=True)
         if not real:
             print("DRY RUN: nothing moved.")
             return
@@ -271,16 +292,13 @@ async def main_async(args):
                     raise SystemExit("could not find the object again after searching nearby; stopping")
                 misses, prev = 0, tgt["world"]
                 known = prev
-            gp = await gripper_pose()
-            gpos = np.array([gp.x, gp.y, gp.z])
-            goal = tgt["world"] if tgt else known           # a stationary object has not gone anywhere: keep the last known spot
-            pre = goal - unit(goal - gpos) * args.standoff_mm
-            err = pre - gpos
-            if np.linalg.norm(err) < args.tol_mm:
+            rel = await rel_of(tgt, known)                 # object in the gripper frame (a stationary object: last known if out of view)
+            pre_g = rel - unit(rel) * args.standoff_mm       # stop standoff_mm short of it, along the line to it
+            if np.linalg.norm(pre_g) < args.tol_mm:
                 print("at the pre-grasp pose", flush=True)
                 break
-            await go(gpos + unit(err) * min(np.linalg.norm(err), args.step_mm), gp)
-            print(f"[A {cycle}] {np.linalg.norm(err):.0f} mm to the pre-grasp pose; object at x{goal[0]:.0f} y{goal[1]:.0f} z{goal[2]:.0f}"
+            await go_rel(unit(pre_g) * min(np.linalg.norm(pre_g), args.step_mm))
+            print(f"[A {cycle}] {np.linalg.norm(pre_g):.0f} mm to the pre-grasp pose; object {rel[2]:.0f} mm ahead, {np.hypot(rel[0], rel[1]):.0f} mm off-axis"
                   + ("" if tgt else " (last known: out of view)"), flush=True)
         else:
             raise SystemExit("did not reach the pre-grasp pose within the cycle limit")
@@ -339,14 +357,13 @@ async def main_async(args):
                 misses, last = 0, t["world"]
                 gp = await gripper_pose()
                 gpos, axis = np.array([gp.x, gp.y, gp.z]), unit([gp.o_x, gp.o_y, gp.o_z])
-            rel = last - gpos                              # dead-reckon on the last known position when it is out of view
-            along = float(rel @ axis)
-            lateral = rel - along * axis
+            rel = await rel_of(t, last)                    # gripper frame; dead-reckons from the last known spot when out of view
+            along, lat = float(rel[2]), float(np.hypot(rel[0], rel[1]))
             if along <= args.hold_mm + args.tol_mm:
                 break
             adv = min(args.step_mm, along - args.hold_mm)
-            await go(gpos + axis * adv + lateral * 0.7, gp)
-            print(f"[C {cycle}] {along:.0f} mm along the axis, {np.linalg.norm(lateral):.0f} mm off to the side" + ("" if t else " (out of view)"), flush=True)
+            await go_rel(np.array([0.7 * rel[0], 0.7 * rel[1], adv]))
+            print(f"[C {cycle}] {along:.0f} mm along the axis, {lat:.0f} mm off to the side" + ("" if t else " (out of view)"), flush=True)
         else:
             raise SystemExit("did not reach the object within the cycle limit")
         # ---- re-check before closing: a person may have moved it ----
@@ -354,8 +371,8 @@ async def main_async(args):
         gp = await gripper_pose()
         gpos, axis = np.array([gp.x, gp.y, gp.z]), unit([gp.o_x, gp.o_y, gp.o_z])
         if t:
-            rel = t["world"] - gpos
-            along, lat = float(rel @ axis), float(np.linalg.norm(rel - (rel @ axis) * axis))
+            rel = t["rel_mm"]
+            along, lat = float(rel[2]), float(np.hypot(rel[0], rel[1]))
             print(f"final check: {along:.0f} mm along, {lat:.0f} mm to the side", flush=True)
             if lat > args.lat_tol_mm or along > args.hold_mm + 60:
                 raise SystemExit("the object is no longer lined up with the gripper (moved?): not closing")
