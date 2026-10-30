@@ -40,6 +40,7 @@ from local_detect import (COLORS, Lock, Range, color_candidates, crop_gray, dete
                           load_detector, object_candidates, roi_candidates, template_candidates)
 from mimic.chat import HELP, parse  # noqa: E402
 from mimic.kinematics import load_validated  # noqa: E402
+from mimic.overlay import draw_plan  # noqa: E402
 from mimic.pipeline import FrameGrabber, Perception  # noqa: E402
 from mimic.plan import attach_joints, build_plan, describe, segment_joint_speed  # noqa: E402
 from mimic.safety import Obstacles  # noqa: E402
@@ -92,12 +93,12 @@ def main():
     ap.add_argument("--hfov", type=float, default=70.0, help="camera horizontal field of view in degrees, if unknown")
     ap.add_argument("--calib-cm", type=float, default=30.0, help="press c with the object this far from the camera")
     # --- centring / plan / execution
-    ap.add_argument("--gain", type=float, default=0.8, help="fraction of the centring error corrected per step")
+    ap.add_argument("--gain", type=float, default=0.7, help="fraction of the centring error corrected per step")
     ap.add_argument("--max-step", type=float, default=60.0, help="largest centring step, mm")
-    ap.add_argument("--deadband", type=float, default=0.03, help="centred when within this fraction of the frame")
-    ap.add_argument("--stable-frames", type=int, default=4, help="centred frames in a row before planning")
+    ap.add_argument("--deadband", type=float, default=0.05, help="close enough to start moving in when within this fraction of the frame")
+    ap.add_argument("--stable-frames", type=int, default=2, help="centred frames in a row before planning")
     ap.add_argument("--settle", type=float, default=0.35, help="seconds to wait after a move before trusting a frame")
-    ap.add_argument("--centre-timeout", type=float, default=40.0)
+    ap.add_argument("--centre-timeout", type=float, default=60.0)
     ap.add_argument("--plan-step-mm", type=float, default=10.0, help="waypoint spacing of the plan")
     ap.add_argument("--max-travel-mm", type=float, default=400.0)
     ap.add_argument("--max-joint-jump", type=float, default=15.0, help="largest joint change between waypoints, deg")
@@ -224,7 +225,7 @@ def main():
     mu = threading.Lock()
     snap = {"x": None, "t": 0.0, "tip": None, "dist": None, "clipped": False, "hpx": None}
     S = {"phase": "idle", "detail": "", "plan": [], "abort": threading.Event(), "confirm": threading.Event(),
-         "waiting": False, "opened": False, "thread": None, "progress": None}
+         "waiting": False, "opened": False, "thread": None, "progress": None, "plan_obj": None, "plan_ctx": None}
     kin_cache = {}
 
     def snapshot():
@@ -307,16 +308,21 @@ def main():
 
     # ---- mission: centre -> plan -> execute -----------------------------------------------------------------------
     def centre():
-        """Camera-guided steps until the object has sat in the middle for --stable-frames frames."""
+        """Camera-guided steps until the object is within --deadband of the middle (a few frames in a row). The rest of
+        the offset is folded into the plan, so the gripper does not wait for a perfect centre. Checks that each step
+        moved the picture the way the learned response J predicted and re-learns J if it did not."""
+        nonlocal J, ddir
         S.update(phase="centring", detail="")
-        last_end, t0, stable, lost = time.monotonic(), time.monotonic(), 0, 0
-        steps = 0
+        t0, stable, lost, steps, bad, reprobes = time.monotonic(), 0, 0, 0, 0, 0
+        gain, prev_e, worse = args.gain, None, 0
+        last_end, prev = time.monotonic(), None            # prev: (features before the last move, the move)
         while True:
             check()
             if time.monotonic() - t0 > args.centre_timeout:
-                say("I couldn't centre the object in time. Stopping.")
+                say("I couldn't centre the object in time (is the camera view blocked, or the camera response wrong? "
+                    "try 'p' to re-learn it). Stopping.")
                 return False
-            sn = wait_fresh(last_end + args.settle, 2.0)
+            sn = wait_fresh(last_end + args.settle + 0.5 * grabber.latency, 2.5)
             if sn is None:
                 lost += 1
                 if lost >= 3:
@@ -326,28 +332,57 @@ def main():
             lost = 0
             s = sn["x"]
             e = float(np.max(np.abs(target[:2] - s[:2])))
-            S["detail"] = f"offset u{s[0]:+.2f} v{s[1]:+.2f}"
+            S["detail"] = f"offset u{s[0]:+.2f} v{s[1]:+.2f} (need < {args.deadband:.2f})"
+            if prev is not None and real:                 # did the last move do what J said it would?
+                s_before, d_prev = prev
+                pred, obs_ = (J @ d_prev)[:2], (s - s_before)[:2]
+                if np.linalg.norm(pred) > 0.02 and np.linalg.norm(obs_) > 0.01:
+                    cos = float(pred @ obs_ / (np.linalg.norm(pred) * np.linalg.norm(obs_)))
+                    ratio = float(np.linalg.norm(obs_) / np.linalg.norm(pred))
+                    bad = bad + 1 if (cos < 0.3 or not 0.3 < ratio < 3.0) else 0
+                elif np.linalg.norm(pred) > 0.04 and np.linalg.norm(obs_) < 0.005:
+                    bad += 1                              # moved a lot and the picture did not change
+                if bad >= 2 and reprobes < 2:
+                    say("The picture is not moving the way my camera model predicts, so I'll re-learn it.")
+                    Jn = probe()
+                    if Jn is None:
+                        return False
+                    J, ddir, bad, reprobes, prev = Jn, depth_direction(Jn), 0, reprobes + 1, None
+                    last_end = time.monotonic()
+                    continue
             if e < args.deadband:
                 stable += 1
-                last_end = time.monotonic()
+                last_end, prev = time.monotonic(), None
                 if stable >= args.stable_frames:
+                    say(f"Centred to within {100 * e:.0f}% (limit {100 * args.deadband:.0f}%): planning the approach.")
                     return True
                 continue
             stable = 0
-            d = servo_step(J, s, target, (0, 1), args.gain, args.max_step)
+            if prev_e is not None and e > prev_e * 1.1:   # getting worse: take smaller steps
+                worse += 1
+                if worse >= 2:
+                    gain, worse = max(gain * 0.7, 0.25), 0
+                    print(f"centring: error rose, step gain now {gain:.2f}", flush=True)
+            else:
+                worse = 0
+            prev_e = e
+            d = servo_step(J, s, target, (0, 1), gain, args.max_step)
             cur = shared["cur"]
             new = np.clip(cur + d, np.minimum(lo, cur), np.maximum(hi, cur))
             safe, hit = obs.constrain(cur, new)
             if hit:
                 say(f"Centring would enter {hit}; stopping short of it.")
             steps += 1
+            if steps % 3 == 1:
+                say(f"Centring: object {100 * e:.0f}% off-centre, moving {np.linalg.norm(safe - cur):.0f} mm.")
             if not real:
                 say(f"Dry run: I would centre it with a move of {d[0]:+.0f} {d[1]:+.0f} {d[2]:+.0f} mm "
                     f"(offset u{s[0]:+.2f} v{s[1]:+.2f}). Assuming it is centred and planning from here.")
                 return True
+            prev = (s.copy(), safe - cur)
             last_end = move_blocking(safe)
 
-    def refine_direction():
+    def refine_direction(c0_mm):
         """Once centred, the camera axis keeps the object centred. Test that with a short forward move along the planned
         direction: any sideways drift of the object in the image means the direction is slightly off, and J turns the
         drift into the correction. Moves back afterwards."""
@@ -366,7 +401,9 @@ def main():
         time.sleep(args.settle)
         if sn1 is None:
             return
-        corr = np.linalg.pinv(J[:2]) @ (sn1["x"][:2] - s0[:2])
+        # moving toward an off-centre object pushes it outward in the picture by itself (perspective); take that out
+        drift = (sn1["x"][:2] - s0[:2]) - s0[:2] * (step / max(c0_mm, 50.0))
+        corr = np.linalg.pinv(J[:2]) @ drift
         new = ddir * step - corr
         new = new / np.linalg.norm(new)
         ang = float(np.degrees(np.arccos(np.clip(new @ ddir, -1, 1))))
@@ -397,10 +434,13 @@ def main():
             print("kinematics:", kin_cache["v"][1], flush=True)
         return kin_cache["v"]
 
-    def make_plan(tip):
+    def make_plan(tip, lateral=None):
         p0 = shared["cur"].copy()
         plan = build_plan(p0, ddir, tip, cfg["stop_cm"], cfg["open_cm"], cfg["slow_cm"], args.fast_speed, args.slow_speed,
-                          obstacles=obs, bounds=bounds, step_mm=args.plan_step_mm, max_travel_mm=args.max_travel_mm)
+                          obstacles=obs, bounds=bounds, step_mm=args.plan_step_mm, max_travel_mm=args.max_travel_mm,
+                          lateral=lateral)
+        if lateral is not None and float(np.linalg.norm(lateral)) > 2.0:
+            plan.notes.append(f"includes a {float(np.linalg.norm(lateral)):.0f} mm sideways correction for the leftover centring error")
         kin, note = get_kin()
         if kin is not None:
             attach_joints(plan, kin, robot.get_joints(), robot.table.apply, args.max_joint_jump)
@@ -490,10 +530,33 @@ def main():
                     return ("replan", m)
         return "done"
 
+    def trim():
+        """After the plan: if the camera can still judge the distance, nudge along the approach line to the stop distance
+        (at most 30 mm either way, backing off if it is too close)."""
+        if not real:
+            return
+        time.sleep(args.settle)
+        sn = wait_fresh(time.monotonic(), 2.5)
+        if sn is None or sn["clipped"]:
+            return
+        m, _ = measure_tip(n=6, timeout=3.0)
+        if m is None:
+            return
+        err_mm = (m - cfg["stop_cm"]) * 10.0
+        if abs(err_mm) < 4.0 or abs(err_mm) > 30.0:
+            return
+        cur = shared["cur"]
+        safe, hit = obs.constrain(cur, np.clip(cur + ddir * err_mm, np.minimum(lo, cur), np.maximum(hi, cur)))
+        if hit:
+            return
+        S["detail"] = f"trimming {err_mm:+.0f} mm"
+        say(f"The camera estimates {m:.1f} cm; moving {err_mm:+.0f} mm along the line to reach {cfg['stop_cm']:.1f} cm.")
+        move_blocking(safe)
+
     def mission():
         nonlocal J, ddir
         try:
-            S.update(plan=[], waiting=False, progress=None, opened=False)
+            S.update(plan=[], waiting=False, progress=None, opened=False, plan_obj=None, plan_ctx=None)
             if J is None:
                 if real:
                     J = probe()
@@ -513,20 +576,32 @@ def main():
                     S.update(phase="idle")
                     return
                 if tip_override is None:
-                    S.update(phase="aligning", detail="")
-                    refine_direction()
                     S.update(phase="measuring", detail="")
                     tip, spread = measure_tip()
                     if tip is None:
                         say(f"I can't get a steady distance to the {det['name']}. Stopping.")
                         S.update(phase="idle")
                         return
+                    S.update(phase="aligning", detail="")
+                    refine_direction(tip * 10.0 + args.tip_offset_mm)
+                    time.sleep(args.settle)
                 else:
                     tip, tip_override = tip_override, None
                 S.update(phase="planning", detail="")
-                plan = make_plan(tip)
+                sn_now = wait_fresh(time.monotonic(), 2.5)
+                lat = np.zeros(3)
+                if sn_now is not None:                    # the leftover centring error becomes part of the plan
+                    lat = servo_step(J, sn_now["x"], target, (0, 1), 1.0, 80.0)
+                plan = make_plan(tip, lat)
                 lines = describe(plan, cfg["slow_cm"], args.fast_speed, args.slow_speed, cfg["open_cm"], args.tip_offset_mm)
                 S["plan"] = lines
+                with perc.mu:
+                    bx = lock.box.copy() if lock.locked else None
+                c0 = tip * 10.0 + args.tip_offset_mm
+                S["plan_ctx"] = {"c0_mm": c0, "p_obj": plan.p0 + plan.direction * c0,
+                                 "size": (float(bx[2] - bx[0]), float(bx[3] - bx[1])) if bx is not None else (80.0, 120.0)}
+                S["progress"] = 0.0
+                S["plan_obj"] = plan                                   # the video overlay draws this live
                 say("\n".join(lines))
                 if not plan.ok or plan.travel_mm < 5:
                     say("I won't execute this plan (it is blocked or there is nothing to do).")
@@ -554,6 +629,7 @@ def main():
                     return
                 if isinstance(result, tuple):
                     tip_override = result[1]
+            trim()
             m, _ = measure_tip(n=4, timeout=2.0)
             S.update(phase="arrived", detail="")
             say(f"Arrived: stopped {cfg['stop_cm']:.1f} cm from the {det['name']}"
@@ -685,7 +761,7 @@ def main():
             with perc.mu:
                 lock.unlock()
             flt.reset()
-            S.update(phase="idle", detail="", plan=[])
+            S.update(phase="idle", detail="", plan=[], plan_obj=None, plan_ctx=None)
             say("Unlocked. Tell me what to go to next.")
         elif k == "stop_distance":
             cfg["stop_cm"] = max(0.5, c["cm"])
@@ -742,7 +818,7 @@ def main():
     if args.auto_engage:
         cmdq.put({"intent": "target", "name": args.lock})
 
-    flt, flt_t, misses, last_print, seen_t = FeatureFilter(), 0.0, 0, 0.0, 0.0
+    flt, flt_t, misses, last_print, last_draw = FeatureFilter(), 0.0, 0, 0.0, 0.0
     try:
         while True:
             while True:
@@ -787,7 +863,8 @@ def main():
                 print(f"[{S['phase']}] {S['detail']}  " + ("" if sn["tip"] is None else f"{sn['tip']:.1f} cm  ")
                       + f"cam {grabber.fps.value:.0f} fps det {perc.fps.value:.0f} fps", flush=True)
 
-            if show or ui:
+            if (show or ui) and now - last_draw >= 0.05:                    # redraw up to 20x a second, live
+                last_draw = now
                 frame = r.frame.copy()
                 h, w = frame.shape[:2]
                 sn = snapshot()
@@ -798,16 +875,21 @@ def main():
                     cv2.line(frame, (w // 2, h // 2), (int((r.feats[0] + 0.5) * w), int((r.feats[1] + 0.5) * h)), (0, 255, 255), 2)
                 busy = S["thread"] is not None and S["thread"].is_alive()
                 col = (0, 200, 0) if busy else (0, 0, 220)
-                lines = [f"{S['phase'].upper() if busy else 'IDLE - say go to the cup'} | {args.sink}", S["detail"],
+                lines = [f"{S['phase'].upper() if (busy or S['phase'] in ('arrived', 'stopped')) else 'IDLE - say go to the cup'} | {args.sink}", S["detail"],
                          ("" if sn["tip"] is None else f"gripper-to-object {sn['tip']:.1f} cm" + ("" if rng.calibrated else " (est)")
                           + f"   stop {cfg['stop_cm']:.1f}  open {cfg['open_cm']:.0f}" + ("  GRIPPER OPEN" if S["opened"] else ""))]
                 for i, text in enumerate(lines):
                     cv2.putText(frame, text, (14, 34 + 34 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 5)
                     cv2.putText(frame, text, (14, 34 + 34 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.8, col if i == 0 else (255, 255, 255), 2)
-                for i, text in enumerate(S["plan"][:9]):                      # the execution plan, on the picture
-                    y = 160 + 24 * i
-                    cv2.putText(frame, text[:110], (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4)
-                    cv2.putText(frame, text[:110], (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 230, 120), 1)
+                po = S["plan_obj"]
+                if po is not None and S["plan_ctx"] is not None:                # the planned trajectory, drawn on the picture
+                    with perc.mu:
+                        bx = lock.box.copy() if lock.locked else None
+                    ctre = ((bx[0] + bx[2]) / 2, (bx[1] + bx[3]) / 2) if bx is not None else (w / 2, h / 2)
+                    size_now = (float(bx[2] - bx[0]), float(bx[3] - bx[1])) if bx is not None else None
+                    draw_plan(frame, po, S["plan_ctx"], shared["cur"], bounds, obs.boxes, args.slow_speed, ctre,
+                              cfg["slow_cm"], cfg["open_cm"], args.tip_offset_mm, progress_mm=S["progress"] or 0.0,
+                              size_now=size_now)
                 if ui:
                     ok_, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
                     if ok_:

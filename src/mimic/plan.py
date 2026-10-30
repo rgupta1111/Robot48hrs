@@ -43,10 +43,13 @@ class Plan:
 
 
 def build_plan(p0, direction, tip_cm, stop_cm, open_cm, slow_cm, fast, slow, obstacles=None, bounds=None,
-               step_mm=10.0, max_travel_mm=400.0, min_speed=8.0):
-    """Straight line from p0 along `direction` (unit vector) covering the (tip_cm - stop_cm) still to go."""
+               step_mm=10.0, max_travel_mm=400.0, min_speed=8.0, lateral=None):
+    """Straight line from p0 covering the (tip_cm - stop_cm) still to go along `direction` (unit vector). `lateral`
+    (mm, perpendicular to direction) is the small remaining centring correction, blended in along the way so the
+    line ends exactly in front of the object."""
     p0, d = np.asarray(p0, float), np.asarray(direction, float)
     d = d / np.linalg.norm(d)
+    lat = np.zeros(3) if lateral is None else np.asarray(lateral, float)
     want = max(0.0, (tip_cm - stop_cm) * 10.0)
     travel, notes, ok = min(want, max_travel_mm), [], True
     if want > max_travel_mm:
@@ -55,7 +58,7 @@ def build_plan(p0, direction, tip_cm, stop_cm, open_cm, slow_cm, fast, slow, obs
     pts, prev = [], p0
     for i in range(n + 1):
         s = travel * i / n
-        p = p0 + d * s
+        p = p0 + d * s + lat * (s / max(want if want <= max_travel_mm else max_travel_mm, 1e-6))
         if bounds is not None:
             lo, hi = np.array(bounds[0::2], float), np.array(bounds[1::2], float)
             if np.any(p < np.minimum(lo, p0) - 1e-6) or np.any(p > np.maximum(hi, p0) + 1e-6):

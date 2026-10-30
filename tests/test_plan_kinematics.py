@@ -131,3 +131,12 @@ def test_joint_space_plan_for_a_straight_approach():
     assert float(np.sum(plan.joint_travel_deg)) <= float(np.sum(direct)) * 1.03 + 0.5   # essentially no wasted motion
     assert segment_joint_speed(plan, 0, len(plan.waypoints) - 1, 100.0) > 2.0
     assert any("joint travel" in l for l in describe(plan, 5.0, 200, 20, 10.0))
+
+
+def test_plan_blends_the_lateral_correction():
+    lat = np.array([0.0, 12.0, -6.0])
+    plan = build_plan([300, 0, 150], [1, 0, 0], tip_cm=20.0, stop_cm=1.0, open_cm=10.0, slow_cm=5.0, fast=150, slow=20, lateral=lat)
+    assert np.allclose(plan.waypoints[0].pos, [300, 0, 150])
+    assert np.allclose(plan.waypoints[-1].pos, [300 + 190, 12.0, 144.0])      # ends exactly in front of the object
+    mid = plan.waypoints[len(plan.waypoints) // 2].pos
+    assert 0 < mid[1] < 12 and mid[2] < 150                                  # drifts there gradually

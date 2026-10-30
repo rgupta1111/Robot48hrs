@@ -32,7 +32,7 @@ class FrameGrabber:
     def __init__(self, fetch, workers=4):
         self.fetch, self.workers = fetch, workers
         self._mu, self._frame, self._t, self.seq, self.fps = threading.Lock(), None, 0.0, 0, _Rate()
-        self._alive, self._threads = True, []
+        self._alive, self._threads, self.latency = True, [], 0.3        # latency: seconds one camera request takes
 
     def start(self):
         for i in range(self.workers):
@@ -53,7 +53,9 @@ class FrameGrabber:
                 continue
             if frame is None:
                 continue
-            t = (t0 + time.monotonic()) / 2      # the picture was taken somewhere during the request
+            dur = time.monotonic() - t0
+            self.latency = 0.8 * self.latency + 0.2 * dur
+            t = t0 + dur / 2                     # the picture was taken somewhere during the request
             with self._mu:
                 if t > self._t:                  # never go back to an older frame
                     self._frame, self._t = frame, t
