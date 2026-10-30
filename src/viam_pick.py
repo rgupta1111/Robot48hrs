@@ -25,6 +25,7 @@ import asyncio
 import os
 import sys
 import time
+import types
 import webbrowser
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -130,6 +131,7 @@ class Perceiver:
                                       # cup), not the one we are after: ignore it and drop the lock
         self.max_sight_mm = 1000.0    # a sighting farther than this from the base axis (or far below the table / above the arm) is a false detection
         self.confirm_n = 2            # the FIRST sighting must be seen this many looks in a row, within 150 mm, before it is trusted
+        self.trim = np.zeros(3)       # constant aiming correction in the gripper frame (--aim-trim-mm)
         self.candidate, self.person_hits, self.person_info, self.rejected = None, 0, "", 0
         self.gate_mm = 200.0          # ...and ignores anything further than this from it (a different bottle: ~30 cm apart; the world
                                       # estimate itself shifts ~12 cm with the viewpoint)
@@ -232,6 +234,7 @@ class Perceiver:
             rel = (await self.robot.transform_pose(PoseInFrame(reference_frame="world", pose=Pose(x=wp.x, y=wp.y, z=wp.z)), self.gripper_name)).pose
         else:
             rel = (await self.robot.transform_pose(PoseInFrame(reference_frame=self.camera_name, pose=cam_pt), self.gripper_name)).pose
+        rel = types.SimpleNamespace(x=rel.x + self.trim[0], y=rel.y + self.trim[1], z=rel.z + self.trim[2])
         self.expected = np.array([wp.x, wp.y, wp.z])      # follow this object from now on
         self.candidate = None
         result = {"seen": True, "world": np.array([wp.x, wp.y, wp.z]), "rel_mm": np.array([rel.x, rel.y, rel.z]), "depth_mm": z, "width_mm": width, "height_mm": height,
@@ -303,6 +306,7 @@ async def main_async(args):
             print(f"loaded the remembered {args.object}: world {np.round(memory.world)}, width {memory.width}", flush=True)
         eye = Perceiver(robot, args.camera, args.gripper, cam, intr, model, dargs, args.object, args.person_mm, args.aim_height_frac, memory)
         eye.max_sight_mm, eye.confirm_n = args.max_sight_mm, args.confirm_sightings
+        eye.trim = np.array([float(v) for v in args.aim_trim_mm.split(',')])
         if memory.world is not None:
             eye.expected = memory.world
         if args.near_world:
@@ -514,14 +518,17 @@ async def main_async(args):
             if touch_ok and ws is not None:
                 allow = Constraints(collision_specification=[CollisionSpecification(allows=[
                     CollisionSpecification.AllowedFrameCollisions(frame1="gripper:claws", frame2=args.object)])])
+            close_in = obstacle_rel is not None and float(obstacle_rel[2]) < args.free_within_mm
             try:
                 try:
                     await motion.move(args.gripper, goal, world_state=ws, constraints=allow)
                 except Exception as e:
-                    if allow is None:
+                    # near the cup the estimated box and the claws overlap by the measurement error (2-5 cm), so the planner refuses every
+                    # step. The cup is the only obstacle dropped; the table and walls stay in the planner's world.
+                    if ws is None or not (allow is not None or (close_in and "obstacle constraint" in str(e))):
                         raise
-                    say(f"  with the claws/object exception the planner said: {str(e)[:220]}", flush=True)
-                    say("  final advance: retrying this step without the obstacle", flush=True)
+                    say(f"  planner: {str(e)[:200]}", flush=True)
+                    say("  close to the cup: retrying this step without the cup as an obstacle", flush=True)
                     await motion.move(args.gripper, goal, world_state=None)
             except Exception as e:
                 if "IK solution" in str(e) or "unreachable" in str(e) or "obstacle constraint" in str(e):
@@ -1389,6 +1396,10 @@ def main():
     ap.add_argument("--wrist-sign", type=int, choices=[-1, 0, 1], default=0)
     ap.add_argument("--lift-mm", type=float, default=120.0)
     ap.add_argument("--yes", action="store_true", help="skip the typed confirmations (not recommended)")
+    ap.add_argument("--free-within-mm", type=float, default=350.0, help="closer than this to the cup (along the gripper axis), a step the planner "
+                    "refuses because of the cup's box is retried without the cup as an obstacle")
+    ap.add_argument("--aim-trim-mm", default="0,0,0", help="x,y,z (gripper frame, mm) added to where the cup is measured to be: corrects a "
+                    "constant aiming error (x = along the jaw opening, y = the other sideways axis, z = along the gripper axis)")
     ap.add_argument("--retries", type=int, default=2, help="after a failed grasp, start the whole pick again this many times (each retry is confirmed)")
     ap.add_argument("--no-grasp-check", dest="grasp_check", action="store_false", help="do not verify the grasp (fingers closed, cup left the table)")
     ap.add_argument("--open-pos", type=float, default=840.0, help="gripper position units when fully open (10 per mm)")
