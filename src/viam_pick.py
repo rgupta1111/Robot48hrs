@@ -1239,7 +1239,7 @@ async def main_async(args):
             say(f"final check: {along:.0f} mm along, {lat:.0f} mm to the side", flush=True)
             if lat > args.lat_tol_mm or along > hold + 45:
                 await retry_attempt("the object is no longer lined up with the gripper (moved?): not closing")
-        width = args.grip_width_mm or (args.cup_grip_mm if eye.label == "cup" else None) or (None if eye.width_estimate() is None else eye.width_estimate() + args.grip_trim_mm)
+        width = args.grip_width_mm or dict(kv.split("=") for kv in args.grip_map.split(",")).get(eye.label) and float(dict(kv.split("=") for kv in args.grip_map.split(",")).get(eye.label)) or (None if eye.width_estimate() is None else eye.width_estimate() + args.grip_trim_mm)
         if width is None or not 25.0 <= width <= 80.0:
             raise SystemExit(f"cannot size the grip (estimated width {width}); pass --grip-width-mm. Not closing.")
         if not flags["grip"] and not await confirm(f"CLOSE the gripper to {width:.0f} mm (position {width * 10:.0f}, no force) and lift {args.lift_mm:.0f} mm."):
@@ -1404,7 +1404,7 @@ def main():
     ap.add_argument("--ask-handover", action="store_true", help="with --yes: still ask before holding the object out to the person")
     ap.add_argument("--box-obstacle", action="store_true", help="size the planner's obstacle from the YOLO box (width and height measured with the "
                     "depth) instead of the voxel map's cluster")
-    ap.add_argument("--cup-grip-mm", type=float, default=70.0, help="grip opening for a cup (the bottle is sized from the camera); --grip-width-mm overrides both")
+    ap.add_argument("--grip-map", default="cup=70,bottle=45", help="grip opening (mm) per object, measured by hand. The camera's width reads 15-25 mm too wide (bottle: 61-72 mm against a real 40-50 mm), so objects not listed here fall back to the camera width; --grip-width-mm overrides everything")
     ap.add_argument("--retries", type=int, default=2, help="after a failed grasp, start the whole pick again this many times (each retry is confirmed)")
     ap.add_argument("--no-grasp-check", dest="grasp_check", action="store_false", help="do not verify the grasp (fingers closed, cup left the table)")
     ap.add_argument("--open-pos", type=float, default=840.0, help="gripper position units when fully open (10 per mm)")
