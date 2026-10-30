@@ -222,6 +222,7 @@ async def main_async(args):
         ip = (await cam.get_properties()).intrinsic_parameters
         intr = {"fx": ip.focal_x_px, "fy": ip.focal_y_px, "cx": ip.center_x_px, "cy": ip.center_y_px, "w": ip.width_px, "h": ip.height_px}
         model, dargs = load_detector(args.object)
+        home = list((await arm.get_joint_positions()).values)          # the ORIGINAL pose: where to come back to if a search pass finds nothing
         memory = ObjectMemory(args.memory_file, args.object)
         if args.use_memory and memory.load():
             print(f"loaded the remembered {args.object}: world {np.round(memory.world)}, width {memory.width}", flush=True)
@@ -421,6 +422,26 @@ async def main_async(args):
             await arm.move_to_joint_positions(JointPositions(values=j_here))
             return None
 
+        async def find_again(known):
+            """INITIAL search only (at the start of the run): search; if the first pass finds nothing, go back to the ORIGINAL pose, detect
+            again, and search once more. Losing the object mid-run uses the nearby search (reacquire) and does not go back to the start."""
+            for attempt in (1, 2):
+                t = await (reacquire(known) if known is not None else survey())
+                if t:
+                    return t
+                print(f"not found on search pass {attempt}: returning to the original pose and looking again", flush=True)
+                await arm.move_to_joint_positions(JointPositions(values=home))
+                eye.lock.unlock()
+                if known is None:
+                    eye.expected = None
+                for _ in range(3):
+                    t, _ = await next_target(None, 0)
+                    if t:
+                        print("  found it from the original pose", flush=True)
+                        return t
+                    await asyncio.sleep(0.3)
+            return None
+
         # ---- look first (dry run: keep looking, so you can move the bottle and watch the target follow) ----
         tgt, misses, prev = None, 0, None
         for i in range(args.looks if not real else 5):
@@ -460,7 +481,7 @@ async def main_async(args):
                        + ". E-stop in reach?"):
             return
         if not_in_view:
-            tgt = await (reacquire(known0) if known0 is not None else survey())
+            tgt = await find_again(known0)
             if not tgt:
                 raise SystemExit("could not find a " + args.object + " by looking around; stopping")
 
